@@ -27,10 +27,11 @@ object BlossomAuthHelper {
         val now = System.currentTimeMillis() / 1000
         val expiration = now + 3600 // 1 hour
 
-        // Tag order for delete: t, expiration, x, server
+        // Tag order for delete: t, expiration, x, p, server
         tags.put(JSONArray().put("t").put("delete"))
         tags.put(JSONArray().put("expiration").put(expiration.toString()))
         tags.put(JSONArray().put("x").put(sha256))
+        tags.put(JSONArray().put("p").put(pubkey))
         
         if (serverUrl != null) {
             tags.put(JSONArray().put("server").put(serverUrl.removeSuffix("/")))

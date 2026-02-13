@@ -155,46 +155,42 @@ class BlossomRepository(private val context: Context) {
         val cleanServer = serverUrl.removeSuffix("/")
         var lastError = ""
 
-        // Strategy 1: PUT /upload (BUD-02)
-        try {
+        suspend fun tryUpload(header: String, method: String, path: String): BlossomUploadResult? {
             val request = Request.Builder()
-                .url("$cleanServer/upload")
-                .put(requestBody)
-                .header("Authorization", authHeader)
+                .url("$cleanServer/$path")
+                .method(method, requestBody)
+                .header("Authorization", header)
                 .header("Content-Type", contentType)
                 .header("Content-Length", data.size.toString())
                 .header("User-Agent", "Aerith/1.0")
                 .build()
             
-            client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    return parseUploadResponse(response.body?.string(), cleanServer)
+            return try {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        parseUploadResponse(response.body?.string(), cleanServer)
+                    } else if (response.code == 401) {
+                        null // Try next prefix
+                    } else {
+                        lastError += " | $method /$path: ${response.code} ${response.body?.string()?.take(100)}"
+                        null
+                    }
                 }
-                lastError = "PUT /upload: ${response.code} ${response.body?.string()}"
+            } catch (e: Exception) {
+                lastError += " | $method /$path: ${e.message}"
+                null
             }
-        } catch (e: Exception) {
-            lastError = "PUT /upload: ${e.message}"
         }
 
-        // Strategy 2: POST /upload
-        try {
-            val request = Request.Builder()
-                .url("$cleanServer/upload")
-                .post(requestBody)
-                .header("Authorization", authHeader)
-                .header("Content-Type", contentType)
-                .header("Content-Length", data.size.toString())
-                .header("User-Agent", "Aerith/1.0")
-                .build()
-
-            client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    return parseUploadResponse(response.body?.string(), cleanServer)
-                }
-                lastError += " | POST /upload: ${response.code} ${response.body?.string()}"
-            }
-        } catch (e: Exception) {
-            lastError += " | POST /upload: ${e.message}"
+        // Strategy 1: PUT /upload (BUD-02)
+        val prefixes = if (authHeader.startsWith("Nostr ")) listOf("Nostr ", "Blossom ") else listOf("Blossom ", "Nostr ")
+        
+        for (prefix in prefixes) {
+            val currentHeader = if (authHeader.startsWith("Nostr ")) authHeader.replaceFirst("Nostr ", prefix) 
+                               else authHeader.replaceFirst("Blossom ", prefix)
+            
+            val result = tryUpload(currentHeader, "PUT", "upload") ?: tryUpload(currentHeader, "POST", "upload")
+            if (result != null) return result
         }
         
         throw Exception("All upload strategies failed: $lastError")
@@ -313,52 +309,39 @@ class BlossomRepository(private val context: Context) {
         Log.i("BlossomRepo", "Attempting to delete blob $sha256 on $cleanServer")
         var lastError = ""
 
-        // Strategy 1: DELETE /<hash> (Standard BUD-02)
-        try {
+        suspend fun tryDelete(header: String, path: String): Boolean {
             val request = Request.Builder()
-                .url("$cleanServer/$sha256")
+                .url("$cleanServer/$path")
                 .delete()
-                .header("Authorization", authHeader)
+                .header("Authorization", header)
                 .header("User-Agent", "Aerith/1.0")
                 .build()
-            client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    Log.i("BlossomRepo", "Delete Strategy 1 SUCCEEDED for $sha256 on $cleanServer")
-                    return@withContext Result.success(Unit)
-                } else {
-                    val errorBody = response.body?.string() ?: "No response body"
-                    lastError = "Strategy 1 (DELETE /<hash>) FAILED: ${response.code} - $errorBody"
-                    Log.w("BlossomRepo", lastError)
-                    val xReason = response.header("X-Reason")
-                    if (xReason != null) Log.w("BlossomRepo", "X-Reason: $xReason")
+            
+            return try {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        Log.i("BlossomRepo", "Delete SUCCEEDED for $sha256 on $cleanServer via $path with prefix ${header.take(10)}")
+                        true
+                    } else {
+                        val errorBody = response.body?.string() ?: "No response body"
+                        lastError += " | $path (${header.take(10)}): ${response.code} - ${errorBody.take(100)}"
+                        false
+                    }
                 }
+            } catch (e: Exception) {
+                lastError += " | $path exception: ${e.message}"
+                false
             }
-        } catch (e: Exception) {
-            lastError = "Strategy 1 (DELETE /<hash>) FAILED with exception: ${e.message}"
-            Log.e("BlossomRepo", lastError, e)
         }
 
-        // Strategy 2: DELETE /media/<hash> (Alternative path)
-        try {
-            val request = Request.Builder()
-                .url("$cleanServer/media/$sha256")
-                .delete()
-                .header("Authorization", authHeader)
-                .header("User-Agent", "Aerith/1.0")
-                .build()
-            client.newCall(request).execute().use { response ->
-                if (response.isSuccessful) {
-                    Log.i("BlossomRepo", "Delete Strategy 2 SUCCEEDED for $sha256 on $cleanServer")
-                    return@withContext Result.success(Unit)
-                } else {
-                    val errorBody = response.body?.string() ?: "No response body"
-                    lastError += " | Strategy 2 (DELETE /media/<hash>) FAILED: ${response.code} - $errorBody"
-                    Log.w("BlossomRepo", lastError)
-                }
-            }
-        } catch (e: Exception) {
-            lastError += " | Strategy 2 (DELETE /media/<hash>) FAILED with exception: ${e.message}"
-            Log.e("BlossomRepo", lastError, e)
+        val prefixes = if (authHeader.startsWith("Nostr ")) listOf("Nostr ", "Blossom ") else listOf("Blossom ", "Nostr ")
+        
+        for (prefix in prefixes) {
+            val currentHeader = if (authHeader.startsWith("Nostr ")) authHeader.replaceFirst("Nostr ", prefix) 
+                               else authHeader.replaceFirst("Blossom ", prefix)
+            
+            if (tryDelete(currentHeader, sha256)) return@withContext Result.success(Unit)
+            if (tryDelete(currentHeader, "media/$sha256")) return@withContext Result.success(Unit)
         }
 
         Log.e("BlossomRepo", "All delete strategies failed for $sha256 on $serverUrl. Full log: $lastError")
