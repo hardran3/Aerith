@@ -20,6 +20,9 @@ data class GalleryState(
     val isLoading: Boolean = false,
     val error: String? = null,
     
+    // Track which servers are currently performing a mirror operation
+    val serverMirroringStates: Map<String, Boolean> = emptyMap(),
+
     // For the new 2-step upload flow
     val preparedUploadHash: String? = null,
     val preparedUploadSize: Long? = null
@@ -88,13 +91,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             applyFilter()
 
             // Save to cache
-            if (mediaBlobs.isNotEmpty()) {
-                try {
-                    val json = listAdapter.toJson(mediaBlobs)
-                    settingsRepository.saveBlobCache(json)
-                } catch (e: Exception) {
-                    android.util.Log.e("GalleryViewModel", "Failed to save cache", e)
-                }
+            saveCache(mediaBlobs)
+        }
+    }
+
+    private fun saveCache(blobs: List<BlossomBlob>) {
+        if (blobs.isNotEmpty()) {
+            try {
+                val json = listAdapter.toJson(blobs)
+                settingsRepository.saveBlobCache(json)
+            } catch (e: Exception) {
+                android.util.Log.e("GalleryViewModel", "Failed to save cache", e)
             }
         }
     }
@@ -146,6 +153,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 val newAll = _uiState.value.allBlobs.filter { it != blob }
                 _uiState.value = _uiState.value.copy(allBlobs = newAll, isLoading = false)
                 applyFilter()
+                saveCache(newAll)
             } else {
                  _uiState.value = _uiState.value.copy(isLoading = false, error = "Delete failed: ${result.exceptionOrNull()?.message}")
             }
@@ -191,6 +199,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     isLoading = false,
                     error = null
                 )
+                // Note: We don't manually add the blob here because we don't have full metadata 
+                // easily available without re-parsing the file. User should refresh.
             } else {
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
@@ -198,6 +208,115 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
             }
             _uiState.value = _uiState.value.copy(preparedUploadHash = null, preparedUploadSize = null)
+        }
+    }
+
+    fun mirrorBlob(
+        server: String,
+        sourceUrl: String,
+        signedEventJson: String,
+        originalBlob: BlossomBlob
+    ) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(
+                serverMirroringStates = _uiState.value.serverMirroringStates + (server to true)
+            )
+            val authHeader = BlossomAuthHelper.encodeAuthHeader(signedEventJson)
+            val result = repository.mirrorBlob(server, sourceUrl, authHeader)
+            
+            if (result.isSuccess) {
+                val uploadResult = result.getOrThrow()
+                val newBlob = originalBlob.copy(
+                    url = uploadResult.url,
+                    serverUrl = server
+                )
+                val newAll = _uiState.value.allBlobs + newBlob
+                _uiState.value = _uiState.value.copy(
+                    allBlobs = newAll,
+                    serverMirroringStates = _uiState.value.serverMirroringStates - server
+                )
+                applyFilter()
+                saveCache(newAll)
+            } else {
+                _uiState.value = _uiState.value.copy(
+                    serverMirroringStates = _uiState.value.serverMirroringStates - server,
+                    error = "Mirror failed: ${result.exceptionOrNull()?.message}"
+                )
+            }
+        }
+    }
+
+    fun mirrorToAll(
+        pubkey: String,
+        blob: BlossomBlob,
+        allServers: List<String>,
+        signer: com.aerith.auth.Nip55Signer,
+        signerPackage: String?
+    ) {
+        viewModelScope.launch {
+            val currentServers = _uiState.value.allBlobs
+                .filter { it.sha256 == blob.sha256 }
+                .mapNotNull { it.serverUrl }
+            
+            val targetServers = allServers.filter { it !in currentServers }
+            
+            if (targetServers.isEmpty()) {
+                _uiState.value = _uiState.value.copy(error = "Already on all servers")
+                return@launch
+            }
+
+            // Set all target servers to mirroring state
+            _uiState.value = _uiState.value.copy(
+                serverMirroringStates = _uiState.value.serverMirroringStates + targetServers.associate { it to true }
+            )
+
+            var successCount = 0
+            var failCount = 0
+            val addedBlobs = mutableListOf<BlossomBlob>()
+
+            targetServers.forEach { server ->
+                val unsigned = BlossomAuthHelper.createUploadAuthEvent(
+                    pubkey = pubkey,
+                    sha256 = blob.sha256,
+                    size = blob.getSizeAsLong(),
+                    mimeType = blob.getMimeType(),
+                    fileName = null,
+                    serverUrl = server
+                )
+
+                val signed = if (signerPackage != null) {
+                    signer.signEventBackground(signerPackage, unsigned, pubkey)
+                } else null
+
+                if (signed != null) {
+                    val authHeader = BlossomAuthHelper.encodeAuthHeader(signed)
+                    val result = repository.mirrorBlob(server, blob.url, authHeader)
+                    if (result.isSuccess) {
+                        successCount++
+                        addedBlobs.add(blob.copy(url = result.getOrThrow().url, serverUrl = server))
+                    } else {
+                        failCount++
+                    }
+                } else {
+                    failCount++
+                }
+                
+                // Clear mirroring state for this server
+                _uiState.value = _uiState.value.copy(
+                    serverMirroringStates = _uiState.value.serverMirroringStates - server
+                )
+            }
+
+            if (addedBlobs.isNotEmpty()) {
+                val newAll = _uiState.value.allBlobs + addedBlobs
+                _uiState.value = _uiState.value.copy(allBlobs = newAll)
+                applyFilter()
+                saveCache(newAll)
+            }
+
+            if (failCount > 0) {
+                _uiState.value = _uiState.value.copy(error = "Mirrored to $successCount servers, $failCount failed.")
+            }
         }
     }
 }

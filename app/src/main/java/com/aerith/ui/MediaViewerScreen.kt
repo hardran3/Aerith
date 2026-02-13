@@ -9,9 +9,11 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CloudUpload
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Storage
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -33,6 +35,7 @@ import coil.compose.SubcomposeAsyncImage
 import com.aerith.AerithApp
 import com.aerith.auth.AuthState
 import com.aerith.auth.Nip55Signer
+import com.aerith.core.nostr.BlossomAuthHelper
 import com.aerith.ui.gallery.GalleryViewModel
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -92,11 +95,14 @@ fun MediaViewerScreen(
         }
     }
 
-    var showSheet by remember { mutableStateOf(false) }
-    val sheetState = rememberModalBottomSheetState()
+    var showInfoSheet by remember { mutableStateOf(false) }
+    var showServerSheet by remember { mutableStateOf(false) }
+    val infoSheetState = rememberModalBottomSheetState()
+    val serverSheetState = rememberModalBottomSheetState()
     
-    // Deletion State
+    // Signer State
     var blobToDelete by remember { mutableStateOf<com.aerith.core.blossom.BlossomBlob?>(null) }
+    var pendingMirrorServer by remember { mutableStateOf<String?>(null) }
     
     val signLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -106,7 +112,10 @@ fun MediaViewerScreen(
             if (signedJson != null) {
                 if (blobToDelete != null) {
                     galleryViewModel.deleteBlob(blobToDelete!!, signedJson)
-                    blobToDelete = null // Reset
+                    blobToDelete = null
+                } else if (pendingMirrorServer != null && currentBlob != null) {
+                    galleryViewModel.mirrorBlob(pendingMirrorServer!!, url, signedJson, currentBlob)
+                    pendingMirrorServer = null
                 }
             }
         }
@@ -150,9 +159,9 @@ fun MediaViewerScreen(
             modifier = Modifier
                 .align(Alignment.BottomCenter)
                 .fillMaxWidth()
-                .background(Color.Black.copy(alpha = 0.5f)) // Semitransparent background
+                .background(Color.Black.copy(alpha = 0.5f))
                 .padding(16.dp)
-                .padding(WindowInsets.navigationBars.asPaddingValues()), // Respect nav bar
+                .padding(WindowInsets.navigationBars.asPaddingValues()),
             horizontalArrangement = Arrangement.SpaceEvenly,
             verticalAlignment = Alignment.CenterVertically
         ) {
@@ -164,89 +173,147 @@ fun MediaViewerScreen(
                         putExtra(android.content.Intent.EXTRA_TEXT, url)
                         type = "text/plain"
                     }
-                    val shareIntent = android.content.Intent.createChooser(sendIntent, "Share Image Link")
+                    val shareIntent = android.content.Intent.createChooser(sendIntent, "Share Media Link")
                     context.startActivity(shareIntent)
                 }
             ) {
-                Icon(
-                    imageVector = androidx.compose.material.icons.Icons.Default.Share,
-                    contentDescription = "Share",
-                    tint = Color.White
-                )
+                Icon(Icons.Default.Share, "Share", tint = Color.White)
+            }
+
+            // Server Settings Button
+            IconButton(
+                onClick = { showServerSheet = true }
+            ) {
+                Icon(Icons.Default.Storage, "Servers", tint = Color.White)
             }
 
             // Info Button
             IconButton(
-                onClick = { showSheet = true }
+                onClick = { showInfoSheet = true }
             ) {
-                Icon(
-                    imageVector = Icons.Default.Info,
-                    contentDescription = "Details",
-                    tint = Color.White
-                )
+                Icon(Icons.Default.Info, "Details", tint = Color.White)
             }
         }
         
-        if (showSheet && currentBlob != null) {
+        // --- Info Sheet ---
+        if (showInfoSheet && currentBlob != null) {
             ModalBottomSheet(
-                onDismissRequest = { showSheet = false },
-                sheetState = sheetState
+                onDismissRequest = { showInfoSheet = false },
+                sheetState = infoSheetState
             ) {
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("File Details", style = MaterialTheme.typography.headlineSmall)
                     Spacer(modifier = Modifier.height(8.dp))
-                    Text("Type: ${currentBlob.type}")
-                    Text("Size: ${currentBlob.size} bytes")
-                    Text("SHA256: ${currentBlob.sha256.take(8)}...")
+                    Text("Type: ${currentBlob.getMimeType()}")
+                    Text("Size: ${currentBlob.getSizeAsLong()} bytes")
+                    Text("SHA256: ${currentBlob.sha256}")
+                    Spacer(modifier = Modifier.height(32.dp))
+                }
+            }
+        }
+
+        // --- Server Management Sheet ---
+        if (showServerSheet && currentBlob != null) {
+            ModalBottomSheet(
+                onDismissRequest = { showServerSheet = false },
+                sheetState = serverSheetState
+            ) {
+                val pk = authState.pubkey
+                val pkg = authState.signerPackage
+                
+                Column(modifier = Modifier.padding(16.dp)) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text("Server Distribution", style = MaterialTheme.typography.headlineSmall)
+                        
+                        if (pk != null) {
+                            TextButton(onClick = {
+                                galleryViewModel.mirrorToAll(pk, currentBlob, authState.blossomServers, signer, pkg)
+                            }) {
+                                Text("Mirror to All")
+                            }
+                        }
+                    }
                     
-                    Divider(modifier = Modifier.padding(vertical = 16.dp))
-                    
-                    Text("Hosted On:", style = MaterialTheme.typography.titleMedium)
                     Spacer(modifier = Modifier.height(8.dp))
                     
                     LazyColumn {
-                        items(relatedBlobs) { blob ->
+                        items(authState.blossomServers) { server ->
+                            val isOnServer = relatedBlobs.any { it.serverUrl == server }
+                            
                             Row(
                                 modifier = Modifier
                                     .fillMaxWidth()
-                                    .padding(vertical = 4.dp),
+                                    .padding(vertical = 8.dp),
                                 horizontalArrangement = Arrangement.SpaceBetween,
                                 verticalAlignment = Alignment.CenterVertically
                             ) {
-                                Text(
-                                    text = blob.serverUrl?.removePrefix("https://")?.removeSuffix("/") ?: "Unknown",
-                                    modifier = Modifier.weight(1f)
-                                )
+                                Column(modifier = Modifier.weight(1f)) {
+                                    val cleanServerName = server.removePrefix("https://").removeSuffix("/")
+                                    Text(
+                                        text = cleanServerName,
+                                        style = MaterialTheme.typography.bodyLarge
+                                    )
+                                    Text(
+                                        text = if (isOnServer) "Hosted" else "Not present",
+                                        style = MaterialTheme.typography.labelSmall,
+                                        color = if (isOnServer) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+                                    )
+                                }
                                 
-                                IconButton(
-                                    onClick = {
-                                        // Trigger Deletion Flow
-                                        val pk = authState.pubkey
-                                        val pkg = authState.signerPackage
-                                        if (pk != null) {
-                                            val eventJson = galleryViewModel.prepareDeleteEvent(pk, blob)
-                                            if (eventJson != null) {
-                                                var signed: String? = null
-                                                if (pkg != null) {
-                                                    signed = signer.signEventBackground(pkg, eventJson, pk)
-                                                }
-                                                
-                                                if (signed != null) {
-                                                    galleryViewModel.deleteBlob(blob, signed)
-                                                } else {
-                                                    blobToDelete = blob
-                                                    val intent = signer.getSignEventIntent(eventJson, pk)
-                                                    signLauncher.launch(intent)
+                                if (pk != null) {
+                                    val isMirroring = uiState.serverMirroringStates[server] ?: false
+                                    
+                                    if (isMirroring) {
+                                        CircularProgressIndicator(
+                                            modifier = Modifier.size(24.dp),
+                                            strokeWidth = 2.dp
+                                        )
+                                    } else if (isOnServer) {
+                                        val blobOnServer = relatedBlobs.find { it.serverUrl == server }!!
+                                        IconButton(
+                                            onClick = {
+                                                val eventJson = galleryViewModel.prepareDeleteEvent(pk, blobOnServer)
+                                                if (eventJson != null) {
+                                                    val signed = if (pkg != null) signer.signEventBackground(pkg, eventJson, pk) else null
+                                                    if (signed != null) {
+                                                        galleryViewModel.deleteBlob(blobOnServer, signed)
+                                                    } else {
+                                                        blobToDelete = blobOnServer
+                                                        signLauncher.launch(signer.getSignEventIntent(eventJson, pk))
+                                                    }
                                                 }
                                             }
+                                        ) {
+                                            Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.error)
+                                        }
+                                    } else {
+                                        IconButton(
+                                            onClick = {
+                                                // Mirroring using BUD-04 (PUT /mirror)
+                                                val unsigned = BlossomAuthHelper.createUploadAuthEvent(
+                                                    pubkey = pk,
+                                                    sha256 = currentBlob.sha256,
+                                                    size = currentBlob.getSizeAsLong(),
+                                                    mimeType = currentBlob.getMimeType(),
+                                                    fileName = null,
+                                                    serverUrl = server
+                                                )
+                                                val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
+                                                if (signed != null) {
+                                                    galleryViewModel.mirrorBlob(server, url, signed, currentBlob)
+                                                } else {
+                                                    pendingMirrorServer = server
+                                                    signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
+                                                }
+                                            }
+                                        ) {
+                                            Icon(Icons.Default.CloudUpload, "Mirror to this server", tint = MaterialTheme.colorScheme.primary)
                                         }
                                     }
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Default.Delete,
-                                        contentDescription = "Delete",
-                                        tint = MaterialTheme.colorScheme.error
-                                    )
                                 }
                             }
                         }

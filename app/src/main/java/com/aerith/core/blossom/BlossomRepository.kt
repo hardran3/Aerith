@@ -300,6 +300,57 @@ class BlossomRepository(private val context: Context) {
         }
     }
 
+    suspend fun mirrorBlob(
+        serverUrl: String,
+        sourceUrl: String,
+        authHeader: String
+    ): Result<BlossomUploadResult> = withContext(Dispatchers.IO) {
+        val cleanServer = serverUrl.removeSuffix("/")
+        Log.i("BlossomRepo", "Attempting to mirror $sourceUrl to $cleanServer")
+        var lastError = ""
+
+        suspend fun tryMirror(header: String): BlossomUploadResult? {
+            val jsonBody = JSONObject().put("url", sourceUrl).toString()
+            val requestBody = jsonBody.toRequestBody("application/json".toMediaTypeOrNull())
+            val request = Request.Builder()
+                .url("$cleanServer/mirror")
+                .put(requestBody)
+                .header("Authorization", header)
+                .header("Content-Type", "application/json")
+                .header("User-Agent", "Aerith/1.0")
+                .build()
+            
+            return try {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful) {
+                        Log.i("BlossomRepo", "Mirror SUCCEEDED for $sourceUrl on $cleanServer with prefix ${header.take(10)}")
+                        parseUploadResponse(response.body?.string(), cleanServer)
+                    } else {
+                        val errorBody = response.body?.string() ?: "No response body"
+                        lastError += " | Mirror (${header.take(10)}): ${response.code} - ${errorBody.take(100)}"
+                        null
+                    }
+                }
+            } catch (e: Exception) {
+                lastError += " | Mirror exception: ${e.message}"
+                null
+            }
+        }
+
+        val prefixes = if (authHeader.startsWith("Nostr ")) listOf("Nostr ", "Blossom ") else listOf("Blossom ", "Nostr ")
+        
+        for (prefix in prefixes) {
+            val currentHeader = if (authHeader.startsWith("Nostr ")) authHeader.replaceFirst("Nostr ", prefix) 
+                               else authHeader.replaceFirst("Blossom ", prefix)
+            
+            val result = tryMirror(currentHeader)
+            if (result != null) return@withContext Result.success(result)
+        }
+
+        Log.e("BlossomRepo", "Mirror failed for $sourceUrl on $serverUrl. Full log: $lastError")
+        Result.failure(Exception("Mirror failed on all strategies for $serverUrl. Last error: $lastError"))
+    }
+
     suspend fun deleteBlob(
         serverUrl: String,
         sha256: String,
