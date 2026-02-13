@@ -73,6 +73,12 @@ class SettingsRepository(context: Context) {
 
     fun getTrashCache(): String? = prefs.getString("trash_cache", null)
 
+    fun saveFileMetadataCache(json: String) {
+        prefs.edit().putString("file_metadata_cache", json).apply()
+    }
+
+    fun getFileMetadataCache(): String? = prefs.getString("file_metadata_cache", null)
+
     fun clear() {
         prefs.edit().clear().apply()
     }

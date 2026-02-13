@@ -9,11 +9,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.CloudUpload
-import androidx.compose.material.icons.filled.Delete
-import androidx.compose.material.icons.filled.Info
-import androidx.compose.material.icons.filled.Share
-import androidx.compose.material.icons.filled.Storage
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
@@ -39,7 +35,7 @@ import com.aerith.auth.Nip55Signer
 import com.aerith.core.nostr.BlossomAuthHelper
 import com.aerith.ui.gallery.GalleryViewModel
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun MediaViewerScreen(
     url: String,
@@ -106,6 +102,7 @@ fun MediaViewerScreen(
     // Signer State
     var blobToDelete by remember { mutableStateOf<com.aerith.core.blossom.BlossomBlob?>(null) }
     var pendingMirrorServer by remember { mutableStateOf<String?>(null) }
+    var pendingLabelUpdateTags by remember { mutableStateOf<List<String>?>(null) }
     
     val signLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -119,6 +116,10 @@ fun MediaViewerScreen(
                 } else if (pendingMirrorServer != null && currentBlob != null) {
                     galleryViewModel.mirrorBlob(pendingMirrorServer!!, url, signedJson, currentBlob)
                     pendingMirrorServer = null
+                } else if (pendingLabelUpdateTags != null && currentBlob != null) {
+                    val pk = authState.pubkey ?: return@rememberLauncherForActivityResult
+                    galleryViewModel.updateLabels(pk, authState.relays, currentBlob, pendingLabelUpdateTags!!, signedJson, signer, authState.signerPackage)
+                    pendingLabelUpdateTags = null
                 }
             }
         }
@@ -204,8 +205,88 @@ fun MediaViewerScreen(
                 onDismissRequest = { showInfoSheet = false },
                 sheetState = infoSheetState
             ) {
+                var newTag by remember { mutableStateOf("") }
+                val pk = authState.pubkey
+                val pkg = authState.signerPackage
+                val currentTags = remember(currentBlob.nip94, uiState.fileMetadata) { 
+                    currentBlob.getTags(uiState.fileMetadata)
+                }
+
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("File Details", style = MaterialTheme.typography.headlineSmall)
+                    Spacer(modifier = Modifier.height(16.dp))
+                    
+                    // --- Labels Section ---
+                    Text("Labels", style = MaterialTheme.typography.titleMedium)
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    // Tag Chips
+                    FlowRow(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        currentTags.forEach { tag ->
+                            InputChip(
+                                selected = true,
+                                onClick = {
+                                    if (pk != null) {
+                                        val updatedTags = currentTags.filter { it != tag }
+                                        val unsigned = BlossomAuthHelper.createFileMetadataEvent(
+                                            pk, currentBlob.sha256, url, currentBlob.getMimeType(), updatedTags
+                                        )
+                                        val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
+                                        if (signed != null) {
+                                            galleryViewModel.updateLabels(pk, authState.relays, currentBlob, updatedTags, signed, signer, pkg)
+                                        } else {
+                                            pendingLabelUpdateTags = updatedTags
+                                            signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
+                                        }
+                                    }
+                                },
+                                label = { Text(tag) },
+                                trailingIcon = { Icon(Icons.Default.Close, null, modifier = Modifier.size(16.dp)) }
+                            )
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(8.dp))
+                    
+                    // Add Tag Input
+                    OutlinedTextField(
+                        value = newTag,
+                        onValueChange = { newTag = it },
+                        label = { Text("Add label...") },
+                        modifier = Modifier.fillMaxWidth(),
+                        singleLine = true,
+                        trailingIcon = {
+                            IconButton(
+                                onClick = {
+                                    if (newTag.isNotBlank() && pk != null) {
+                                        val updatedTags = (currentTags + newTag.trim()).distinct()
+                                        val unsigned = BlossomAuthHelper.createFileMetadataEvent(
+                                            pk, currentBlob.sha256, url, currentBlob.getMimeType(), updatedTags
+                                        )
+                                        val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
+                                        
+                                        if (signed != null) {
+                                            galleryViewModel.updateLabels(pk, authState.relays, currentBlob, updatedTags, signed, signer, pkg)
+                                            newTag = ""
+                                        } else {
+                                            pendingLabelUpdateTags = updatedTags
+                                            signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
+                                            newTag = ""
+                                        }
+                                    }
+                                }
+                            ) {
+                                Icon(Icons.Default.Add, null)
+                            }
+                        }
+                    )
+
+                    Divider(modifier = Modifier.padding(vertical = 16.dp))
+                    
+                    Text("Metadata", style = MaterialTheme.typography.titleMedium)
                     Spacer(modifier = Modifier.height(8.dp))
                     Text("Type: ${currentBlob.getMimeType()}")
                     Text("Size: ${currentBlob.getSizeAsLong()} bytes")
@@ -296,7 +377,6 @@ fun MediaViewerScreen(
                                     } else {
                                         IconButton(
                                             onClick = {
-                                                // Mirroring using BUD-04 (PUT /mirror)
                                                 val unsigned = BlossomAuthHelper.createUploadAuthEvent(
                                                     pubkey = pk,
                                                     sha256 = currentBlob.sha256,

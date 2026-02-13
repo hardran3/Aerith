@@ -25,6 +25,7 @@ data class AuthState(
     val profileUrl: String? = null,
     val profileName: String? = null,
     val signerPackage: String? = null,
+    val fileMetadata: Map<String, List<String>> = emptyMap(), // hash -> tags
     val isLoading: Boolean = false,
     val error: String? = null
 )
@@ -41,6 +42,23 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         // Load cached data
         val cachedPubkey = settingsRepository.getPubkey()
         if (cachedPubkey != null) {
+            val cachedMetadataJson = settingsRepository.getFileMetadataCache()
+            val metadata = if (cachedMetadataJson != null) {
+                try {
+                    val json = org.json.JSONObject(cachedMetadataJson)
+                    val map = mutableMapOf<String, List<String>>()
+                    json.keys().forEach { hash ->
+                        val tagsArray = json.getJSONArray(hash)
+                        val tags = mutableListOf<String>()
+                        for (i in 0 until tagsArray.length()) {
+                            tags.add(tagsArray.getString(i))
+                        }
+                        map[hash] = tags
+                    }
+                    map
+                } catch (e: Exception) { emptyMap() }
+            } else emptyMap()
+
             _uiState.value = AuthState(
                 isLoggedIn = true,
                 pubkey = cachedPubkey,
@@ -48,7 +66,8 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                 blossomServers = settingsRepository.getBlossomServers(),
                 profileName = settingsRepository.getProfileName(),
                 profileUrl = settingsRepository.getProfileUrl(),
-                signerPackage = settingsRepository.getSignerPackage()
+                signerPackage = settingsRepository.getSignerPackage(),
+                fileMetadata = metadata
             )
             // Still refresh data in background
             fetchRelayList(cachedPubkey)
@@ -158,6 +177,9 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
             
             // 3. Fetch User Profile (Kind 0)
             fetchProfile(pubkey, relaysToUse)
+
+            // 4. Fetch File Metadata (Kind 1063)
+            fetchFileMetadata(pubkey, relaysToUse)
         }
     }
 
@@ -281,6 +303,61 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                     }
                 } catch (e: Exception) {
                     Log.e("AuthViewModel", "Failed to parse profile", e)
+                }
+            }
+        }
+    }
+
+    private fun fetchFileMetadata(pubkey: String, relays: List<String>) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val uniqueRelays = (relays + listOf("wss://purplepag.es", "wss://relay.damus.io")).distinct().take(8)
+            
+            val deferred = uniqueRelays.map { url ->
+                async {
+                    try {
+                        val client = RelayClient(url)
+                        // Kind 1063: File Metadata
+                        client.fetchEvent("""{"kinds": [1063], "authors": ["$pubkey"]}""")
+                    } catch (e: Exception) { emptyList<Event>() }
+                }
+            }
+            
+            val allEvents = deferred.awaitAll().flatten()
+            val metadataMap = mutableMapOf<String, List<String>>()
+            
+            // Group by hash 'x' and take latest event per hash
+            allEvents.groupBy { event ->
+                event.tags.find { it.firstOrNull() == "x" }?.getOrNull(1)?.lowercase()
+            }.forEach { (hash, events) ->
+                if (hash != null) {
+                    val latest = events.maxByOrNull { it.createdAt }
+                    val tags = latest?.tags?.filter { it.firstOrNull() == "t" }?.mapNotNull { it.getOrNull(1) } ?: emptyList()
+                    metadataMap[hash] = tags.distinct()
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                if (metadataMap.isNotEmpty()) {
+                    val currentMetadata = _uiState.value.fileMetadata.toMutableMap()
+                    // Update current metadata with fresh data from relays
+                    metadataMap.forEach { (h, t) ->
+                        currentMetadata[h] = t
+                    }
+                    
+                    _uiState.value = _uiState.value.copy(fileMetadata = currentMetadata)
+                    
+                    // Save to cache
+                    try {
+                        val json = org.json.JSONObject()
+                        currentMetadata.forEach { (h, t) ->
+                            val arr = org.json.JSONArray()
+                            t.forEach { arr.put(it) }
+                            json.put(h, arr)
+                        }
+                        settingsRepository.saveFileMetadataCache(json.toString())
+                    } catch (e: Exception) {
+                        Log.e("AuthViewModel", "Failed to save metadata cache", e)
+                    }
                 }
             }
         }

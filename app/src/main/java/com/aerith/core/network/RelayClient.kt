@@ -83,4 +83,44 @@ class RelayClient(private val url: String) {
         
         return events
     }
+
+    fun publishEvent(signedEventJson: String): Boolean {
+        Log.d("RelayClient", "publishEvent called for $url")
+        val latch = CountDownLatch(1)
+        var success = false
+
+        val request = Request.Builder().url(url).build()
+        val listener = object : WebSocketListener() {
+            override fun onOpen(webSocket: WebSocket, response: Response) {
+                val msg = "[\"EVENT\", $signedEventJson]"
+                webSocket.send(msg)
+                Log.d("RelayClient", "Sent EVENT: $msg")
+            }
+
+            override fun onMessage(webSocket: WebSocket, text: String) {
+                try {
+                    val jsonArray = moshi.adapter(List::class.java).fromJson(text) ?: return
+                    val type = jsonArray[0] as? String ?: return
+                    
+                    if (type == "OK" && jsonArray.size >= 3) {
+                        success = jsonArray[2] as? Boolean ?: false
+                        Log.d("RelayClient", "Received OK from $url: $success")
+                        latch.countDown()
+                    }
+                } catch (e: Exception) {
+                    Log.e("RelayClient", "Error parsing message", e)
+                }
+            }
+
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                Log.e("RelayClient", "WebSocket Failure on $url", t)
+                latch.countDown()
+            }
+        }
+
+        val ws = client.newWebSocket(request, listener)
+        latch.await(5, TimeUnit.SECONDS)
+        ws.close(1000, "Done")
+        return success
+    }
 }

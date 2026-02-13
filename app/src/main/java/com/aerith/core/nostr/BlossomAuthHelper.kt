@@ -109,6 +109,35 @@ object BlossomAuthHelper {
     }
 
     /**
+     * Creates an unsigned Kind 1063 File Metadata event.
+     */
+    fun createFileMetadataEvent(
+        pubkey: String,
+        sha256: String,
+        url: String,
+        mimeType: String?,
+        tags: List<String>
+    ): String {
+        val eventTags = JSONArray()
+        eventTags.put(JSONArray().put("x").put(sha256))
+        eventTags.put(JSONArray().put("url").put(url))
+        if (mimeType != null) eventTags.put(JSONArray().put("m").put(mimeType))
+        
+        tags.forEach { tag ->
+            eventTags.put(JSONArray().put("t").put(tag))
+        }
+
+        val event = JSONObject()
+        event.put("kind", 1063)
+        event.put("content", "")
+        event.put("pubkey", pubkey)
+        event.put("created_at", System.currentTimeMillis() / 1000)
+        event.put("tags", eventTags)
+
+        return event.toString()
+    }
+
+    /**
      * Encodes the signed event JSON into a Base64 string suitable for the
      * `Authorization: Nostr <base64>` header.
      */

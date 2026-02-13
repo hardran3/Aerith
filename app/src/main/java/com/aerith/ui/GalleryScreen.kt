@@ -27,7 +27,6 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
-import coil.compose.SubcomposeAsyncImage
 import com.aerith.auth.AuthState
 import com.aerith.core.blossom.BlossomBlob
 import com.aerith.core.nostr.BlossomAuthHelper
@@ -101,7 +100,7 @@ fun GalleryScreen(
                     // Finished all servers
                     val finalHeaders = authenticatedListHeaders.toMap()
                     authState.pubkey?.let { pk ->
-                        galleryViewModel.loadImages(pk, authState.blossomServers, finalHeaders)
+                        galleryViewModel.loadImages(pk, authState.blossomServers, finalHeaders, authState.fileMetadata)
                     }
                     pendingListAuth = null
                     currentSigningServer = null
@@ -151,7 +150,7 @@ fun GalleryScreen(
 
             if (remainingServers.isEmpty()) {
                 // All signed in background!
-                galleryViewModel.loadImages(pubkey, servers, headers)
+                galleryViewModel.loadImages(pubkey, servers, headers, authState.fileMetadata)
                 isSigningFlowActive = false
             } else {
                 // Some or all need UI interaction
@@ -230,6 +229,13 @@ fun GalleryScreen(
             triggerAuthenticatedList()
             android.widget.Toast.makeText(context, uploadState.successMessage, android.widget.Toast.LENGTH_SHORT).show()
             uploadViewModel.clearState()
+        }
+    }
+
+    // New: Re-sync labels when fresh metadata is discovered on relays
+    LaunchedEffect(authState.fileMetadata) {
+        if (authState.pubkey != null && authState.blossomServers.isNotEmpty() && authState.fileMetadata.isNotEmpty()) {
+            galleryViewModel.loadImages(authState.pubkey, authState.blossomServers, emptyMap(), authState.fileMetadata)
         }
     }
 
@@ -357,34 +363,92 @@ fun GalleryScreen(
             }
         }
     ) { padding ->
-        Box(modifier = Modifier.fillMaxSize().padding(padding)) {
-            if (state.isLoading || uploadState.isUploading) {
-                CircularProgressIndicator(modifier = Modifier.align(Alignment.Center))
-            } else if (state.error != null) {
-                Text(
-                    text = "Gallery Error: ${state.error}",
-                    color = MaterialTheme.colorScheme.error,
-                    modifier = Modifier.align(Alignment.Center).padding(16.dp)
+        val allTags = remember(state.allBlobs, state.trashBlobs, state.fileMetadata) {
+            (state.allBlobs + state.trashBlobs).flatMap { it.getTags(state.fileMetadata) }.distinct().sorted()
+        }
+
+        Column(modifier = Modifier.fillMaxSize().padding(padding)) {
+            // Background update indicator
+            if (state.isLoading && state.allBlobs.isNotEmpty()) {
+                LinearProgressIndicator(
+                    modifier = Modifier.fillMaxWidth(),
+                    color = MaterialTheme.colorScheme.primary,
+                    trackColor = MaterialTheme.colorScheme.surfaceVariant
                 )
-            } else if (state.filteredBlobs.isEmpty()) {
-                Text(
-                    text = if (state.selectedServer == "TRASH") "Trash is empty." else "No media found.",
-                    modifier = Modifier.align(Alignment.Center)
-                )
-            } else {
-                LazyVerticalGrid(
-                    columns = GridCells.Adaptive(minSize = 120.dp),
-                    contentPadding = PaddingValues(4.dp),
-                    modifier = Modifier.fillMaxSize()
+            }
+
+            if (allTags.isNotEmpty()) {
+                ScrollableTabRow(
+                    selectedTabIndex = -1,
+                    edgePadding = 16.dp,
+                    containerColor = Color.Transparent,
+                    divider = {},
+                    indicator = {}
                 ) {
-                    items(
-                        items = state.filteredBlobs,
-                        key = { it.sha256 } // Stable keys for high-performance scrolling
-                    ) { blob ->
-                        MediaItem(
-                            blob = blob,
-                            onClick = { onMediaClick(blob.url) }
+                    allTags.forEach { tag ->
+                        val isSelected = state.selectedTags.contains(tag)
+                        FilterChip(
+                            selected = isSelected,
+                            onClick = { galleryViewModel.toggleTag(tag) },
+                            label = { Text(tag) },
+                            modifier = Modifier.padding(horizontal = 4.dp),
+                            leadingIcon = if (isSelected) {
+                                { Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp)) }
+                            } else null
                         )
+                    }
+                    if (state.selectedTags.isNotEmpty()) {
+                        TextButton(onClick = { galleryViewModel.clearTags() }) {
+                            Text("Clear")
+                        }
+                    }
+                }
+            }
+
+            Box(modifier = Modifier.weight(1f)) {
+                // Initial load or background refresh when empty
+                val isInitialLoad = !hasAutoRefreshed || (state.isLoading && state.allBlobs.isEmpty())
+                
+                if (isInitialLoad && !uploadState.isUploading) {
+                    Column(
+                        modifier = Modifier.fillMaxSize(),
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.Center
+                    ) {
+                        CircularProgressIndicator()
+                        Spacer(modifier = Modifier.height(16.dp))
+                        Text(
+                            text = "Blossom Servers Loading...",
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                } else if (state.error != null) {
+                    Text(
+                        text = "Gallery Error: ${state.error}",
+                        color = MaterialTheme.colorScheme.error,
+                        modifier = Modifier.align(Alignment.Center).padding(16.dp)
+                    )
+                } else if (state.filteredBlobs.isEmpty()) {
+                    Text(
+                        text = if (state.selectedServer == "TRASH") "Trash is empty." else "No media found.",
+                        modifier = Modifier.align(Alignment.Center)
+                    )
+                } else {
+                    LazyVerticalGrid(
+                        columns = GridCells.Adaptive(minSize = 120.dp),
+                        contentPadding = PaddingValues(4.dp),
+                        modifier = Modifier.fillMaxSize()
+                    ) {
+                        items(
+                            items = state.filteredBlobs,
+                            key = { it.sha256 } // Stable keys for high-performance scrolling
+                        ) { blob ->
+                            MediaItem(
+                                blob = blob,
+                                onClick = { onMediaClick(blob.url) }
+                            )
+                        }
                     }
                 }
             }

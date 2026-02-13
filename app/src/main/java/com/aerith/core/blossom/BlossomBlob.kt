@@ -47,6 +47,38 @@ data class BlossomBlob(
     }
 
     /**
+     * Helper to get all 't' tags (labels) from NIP-94 tags or metadata.
+     */
+    fun getTags(fileMetadata: Map<String, List<String>> = emptyMap()): List<String> {
+        // Priority 1: Local/Relay metadata (manual labels)
+        // Ensure case-insensitive hash lookup
+        val normalizedHash = sha256.lowercase()
+        val localTags = fileMetadata[normalizedHash] ?: fileMetadata[sha256]
+        if (localTags != null) return localTags
+
+        // Priority 2: Server-side nip94 tags
+        val raw = nip94 ?: return emptyList()
+
+        // Handle List format: [["t", "label1"], ["t", "label2"]]
+        if (raw is List<*>) {
+            return raw.mapNotNull { item ->
+                val tagList = item as? List<*>
+                if (tagList?.firstOrNull() == "t") {
+                    tagList.getOrNull(1) as? String
+                } else null
+            }.distinct()
+        }
+        
+        // Handle Map format: {"tags": ["label1", "label2"]}
+        if (raw is Map<*, *>) {
+            val tags = raw["tags"] as? List<*>
+            if (tags != null) return tags.filterIsInstance<String>().distinct()
+        }
+
+        return emptyList()
+    }
+
+    /**
      * Helper to get the creation timestamp regardless of which field the server used.
      */
     fun getCreationTime(): Long? {
