@@ -13,6 +13,12 @@ class SettingsRepository(context: Context) {
 
     fun getPubkey(): String? = prefs.getString("pubkey", null)
 
+    fun saveSignerPackage(packageName: String?) {
+        prefs.edit().putString("signer_package", packageName).apply()
+    }
+
+    fun getSignerPackage(): String? = prefs.getString("signer_package", null)
+
     fun saveRelays(relays: List<String>) {
         val array = JSONArray()
         relays.forEach { array.put(it) }

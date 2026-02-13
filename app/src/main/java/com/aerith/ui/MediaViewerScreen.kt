@@ -221,12 +221,23 @@ fun MediaViewerScreen(
                                 IconButton(
                                     onClick = {
                                         // Trigger Deletion Flow
-                                        if (authState.pubkey != null) {
-                                            blobToDelete = blob
-                                            val eventJson = galleryViewModel.prepareDeleteEvent(authState.pubkey, blob)
+                                        val pk = authState.pubkey
+                                        val pkg = authState.signerPackage
+                                        if (pk != null) {
+                                            val eventJson = galleryViewModel.prepareDeleteEvent(pk, blob)
                                             if (eventJson != null) {
-                                                val intent = signer.getSignEventIntent(eventJson, authState.pubkey)
-                                                signLauncher.launch(intent)
+                                                var signed: String? = null
+                                                if (pkg != null) {
+                                                    signed = signer.signEventBackground(pkg, eventJson, pk)
+                                                }
+                                                
+                                                if (signed != null) {
+                                                    galleryViewModel.deleteBlob(blob, signed)
+                                                } else {
+                                                    blobToDelete = blob
+                                                    val intent = signer.getSignEventIntent(eventJson, pk)
+                                                    signLauncher.launch(intent)
+                                                }
                                             }
                                         }
                                     }

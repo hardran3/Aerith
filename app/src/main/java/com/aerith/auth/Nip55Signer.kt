@@ -41,6 +41,45 @@ class Nip55Signer(private val context: Context) {
             .putExtra("type", "sign_event")
             .putExtra("current_user", loggedInPubkey)
     }
+
+    /**
+     * Attempts to sign an event in the background without UI flashing.
+     * Requires the user to have previously checked "Always allow" in the signer app.
+     */
+    fun signEventBackground(signerPackage: String, eventJson: String, loggedInPubkey: String): String? {
+        val uri = Uri.parse("content://$signerPackage.SIGN_EVENT")
+        val projection = arrayOf(eventJson, "", loggedInPubkey)
+        
+        return try {
+            context.contentResolver.query(uri, projection, null, null, null)?.use { cursor ->
+                if (cursor.moveToFirst()) {
+                    // NIP-55: The signer application MUST return the signed event JSON in the 'event' column.
+                    val eventIndex = cursor.getColumnIndex("event")
+                    val resultIndex = cursor.getColumnIndex("result")
+                    val sigIndex = cursor.getColumnIndex("signature")
+                    
+                    val result = when {
+                        eventIndex >= 0 -> cursor.getString(eventIndex)
+                        resultIndex >= 0 -> cursor.getString(resultIndex)
+                        sigIndex >= 0 -> cursor.getString(sigIndex)
+                        else -> null
+                    }
+
+                    // Blossom requires the FULL event JSON in the header. 
+                    // If we got just a hex signature (64 bytes / 128 chars), this is insufficient.
+                    if (result != null && result.trim().startsWith("{")) {
+                        result
+                    } else {
+                        android.util.Log.w("Nip55Signer", "Background signer returned non-JSON result: $result")
+                        null
+                    }
+                } else null
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("Nip55Signer", "Background signing failed", e)
+            null
+        }
+    }
     
     fun parseSignEventResult(intent: Intent?): String? {
         // Amber returns the full signed event JSON in "event" or "result".

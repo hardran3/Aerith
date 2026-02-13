@@ -24,6 +24,7 @@ data class AuthState(
     val blossomServers: List<String> = emptyList(),
     val profileUrl: String? = null,
     val profileName: String? = null,
+    val signerPackage: String? = null,
     val isLoading: Boolean = false,
     val error: String? = null
 )
@@ -46,7 +47,8 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                 relays = settingsRepository.getRelays(),
                 blossomServers = settingsRepository.getBlossomServers(),
                 profileName = settingsRepository.getProfileName(),
-                profileUrl = settingsRepository.getProfileUrl()
+                profileUrl = settingsRepository.getProfileUrl(),
+                signerPackage = settingsRepository.getSignerPackage()
             )
             // Still refresh data in background
             fetchRelayList(cachedPubkey)
@@ -55,6 +57,15 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
 
     fun onLoginResult(intent: Intent?) {
         val rawPubkey = intent?.getStringExtra("signature") ?: return 
+        val packageName = intent.getStringExtra("package") ?: intent.getStringExtra("result")?.let {
+            // Some signers return pkg name in standard way, some might need manual check.
+            // But NIP-55 says extra "package" should be present.
+            null
+        }
+        
+        // If package is missing, try to find it from the calling package if possible?
+        // Actually, NIP-55 says: "The signer application MUST return its package name in the package extra"
+        val finalPackage = packageName ?: intent.component?.packageName
         
         // Ensure we store HEX pubkey in state
         val pubkey = if (rawPubkey.startsWith("npub")) {
@@ -71,9 +82,11 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         
         if (pubkey.isNotEmpty()) {
             settingsRepository.savePubkey(pubkey)
+            settingsRepository.saveSignerPackage(finalPackage)
             _uiState.value = _uiState.value.copy(
                 isLoggedIn = true,
                 pubkey = pubkey,
+                signerPackage = finalPackage,
                 isLoading = true
             )
             fetchRelayList(pubkey)

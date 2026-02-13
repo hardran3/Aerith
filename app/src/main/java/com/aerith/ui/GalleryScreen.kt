@@ -127,22 +127,44 @@ fun GalleryScreen(
     fun triggerAuthenticatedList() {
         val pubkey = authState.pubkey
         val servers = authState.blossomServers
+        val pkg = authState.signerPackage
         if (pubkey == null || servers.isEmpty() || isSigningFlowActive) return
 
         isSigningFlowActive = true
         scope.launch {
             val unsignedEvents = galleryViewModel.prepareListEvents(pubkey, servers)
-            val iterator = unsignedEvents.entries.iterator()
-            pendingListAuth = iterator
-            authenticatedListHeaders.clear()
+            val headers = mutableMapOf<String, String>()
+            val remainingServers = mutableListOf<Map.Entry<String, String>>()
 
-            if (iterator.hasNext()) {
-                val (server, event) = iterator.next()
-                currentSigningServer = server
-                val intent = signer.getSignEventIntent(event, pubkey)
-                signLauncher.launch(intent)
-            } else {
+            unsignedEvents.forEach { (server, event) ->
+                var signed: String? = null
+                if (pkg != null) {
+                    signed = signer.signEventBackground(pkg, event, pubkey)
+                }
+                
+                if (signed != null) {
+                    headers[server] = BlossomAuthHelper.encodeAuthHeader(signed)
+                } else {
+                    remainingServers.add(java.util.AbstractMap.SimpleEntry(server, event))
+                }
+            }
+
+            if (remainingServers.isEmpty()) {
+                // All signed in background!
+                galleryViewModel.loadImages(pubkey, servers, headers)
                 isSigningFlowActive = false
+            } else {
+                // Some or all need UI interaction
+                authenticatedListHeaders.clear()
+                authenticatedListHeaders.putAll(headers)
+                val iterator = remainingServers.iterator()
+                pendingListAuth = iterator
+                if (iterator.hasNext()) {
+                    val (server, event) = iterator.next()
+                    currentSigningServer = server
+                    val intent = signer.getSignEventIntent(event, pubkey)
+                    signLauncher.launch(intent)
+                }
             }
         }
     }
@@ -161,18 +183,38 @@ fun GalleryScreen(
         val hash = uploadState.preparedUploadHash
         val size = uploadState.preparedUploadSize
         val pubkey = authState.pubkey
+        val pkg = authState.signerPackage
 
         if (hash != null && size != null && pubkey != null && !isSigningFlowActive) {
-            isSigningFlowActive = true
-            val server = authState.blossomServers.firstOrNull()
+            val server = authState.blossomServers.firstOrNull() ?: return@LaunchedEffect
             val unsignedEvent = BlossomAuthHelper.createUploadAuthEvent(
                 pubkey = pubkey, sha256 = hash, size = size,
                 mimeType = pendingUpload?.second,
                 fileName = pendingUpload?.first?.lastPathSegment,
                 serverUrl = server
             )
-            val intent = signer.getSignEventIntent(unsignedEvent, pubkey)
-            signLauncher.launch(intent)
+            
+            var signed: String? = null
+            if (pkg != null) {
+                signed = signer.signEventBackground(pkg, unsignedEvent, pubkey)
+            }
+            
+            if (signed != null) {
+                // Sign in background succeeded!
+                uploadViewModel.uploadFile(
+                    serverUrl = server,
+                    uri = pendingUpload!!.first,
+                    mimeType = pendingUpload!!.second,
+                    signedEventJson = signed,
+                    expectedHash = hash
+                )
+                pendingUpload = null
+            } else {
+                // Fallback to Intent
+                isSigningFlowActive = true
+                val intent = signer.getSignEventIntent(unsignedEvent, pubkey)
+                signLauncher.launch(intent)
+            }
         }
     }
     
