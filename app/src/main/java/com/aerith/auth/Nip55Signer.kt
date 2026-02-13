@@ -1,0 +1,66 @@
+package com.aerith.auth
+
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
+import androidx.activity.result.ActivityResultLauncher
+import com.aerith.core.nostr.Event
+import com.squareup.moshi.Moshi
+import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
+import kotlin.coroutines.resumeWithException
+
+class Nip55Signer(private val context: Context) {
+
+    private val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+    private val eventAdapter = moshi.adapter(Event::class.java)
+
+    fun isExternalSignerInstalled(): Boolean {
+        val intent = Intent(Intent.ACTION_VIEW, Uri.parse("nostrsigner:"))
+        val info = context.packageManager.queryIntentActivities(intent, 0)
+        return info.isNotEmpty()
+    }
+
+    /**
+     * Helper to parse the result from the activity launcher.
+     * This is a bit complex because the result comes back asynchronously via the ActivityResultCallback.
+     * For simplicity in this initial phase, we will rely on the ViewModel to handle the ActivityResultLauncher.
+     * This class will primarily generate the Intents.
+     */
+    
+    fun getLoginIntent(): Intent {
+        val permissions = """[{"type":"sign_event","kind":10002},{"type":"sign_event","kind":10063},{"type":"sign_event","kind":24242},{"type":"nip04_encrypt"},{"type":"nip04_decrypt"}]"""
+        return Intent(Intent.ACTION_VIEW, Uri.parse("nostrsigner:"))
+            .putExtra("type", "get_public_key")
+            .putExtra("permissions", permissions)
+    }
+
+    fun getSignEventIntent(eventJson: String, loggedInPubkey: String): Intent {
+        return Intent(Intent.ACTION_VIEW, Uri.parse("nostrsigner:$eventJson"))
+            .putExtra("type", "sign_event")
+            .putExtra("current_user", loggedInPubkey)
+    }
+    
+    fun parseSignEventResult(intent: Intent?): String? {
+        // Amber returns the full signed event JSON in "event" or "result".
+        // "signature" contains only the raw sig hex — NOT what we want for NIP-98.
+        return intent?.getStringExtra("event")
+            ?: intent?.getStringExtra("result")
+            ?: intent?.getStringExtra("signature")
+    }
+
+    fun getNip04EncryptIntent(plainText: String, recipientPubkey: String, loggedInPubkey: String): Intent {
+        return Intent(Intent.ACTION_VIEW, Uri.parse("nostrsigner:$plainText"))
+            .putExtra("type", "nip04_encrypt")
+            .putExtra("pubKey", recipientPubkey)
+            .putExtra("current_user", loggedInPubkey)
+    }
+    
+    fun getNip04DecryptIntent(encryptedText: String, senderPubkey: String, loggedInPubkey: String): Intent {
+        return Intent(Intent.ACTION_VIEW, Uri.parse("nostrsigner:$encryptedText"))
+            .putExtra("type", "nip04_decrypt")
+            .putExtra("pubKey", senderPubkey)
+            .putExtra("current_user", loggedInPubkey)
+    }
+}
