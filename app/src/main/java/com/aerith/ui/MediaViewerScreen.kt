@@ -32,6 +32,7 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
 import coil.compose.SubcomposeAsyncImage
+import coil.request.ImageRequest
 import com.aerith.AerithApp
 import com.aerith.auth.AuthState
 import com.aerith.auth.Nip55Signer
@@ -49,8 +50,10 @@ fun MediaViewerScreen(
     val context = LocalContext.current
     val signer = remember { Nip55Signer(context) }
     
-    // Find the blob for the current URL
-    val currentBlob = remember(uiState.allBlobs, url) { uiState.allBlobs.find { it.url == url } }
+    // Find the blob for the current URL (search both active and trash)
+    val currentBlob = remember(uiState.allBlobs, uiState.trashBlobs, url) { 
+        uiState.allBlobs.find { it.url == url } ?: uiState.trashBlobs.find { it.url == url }
+    }
     val isVideo = remember(currentBlob) { currentBlob?.getMimeType()?.startsWith("video/") == true }
 
     // ExoPlayer setup with caching
@@ -138,7 +141,7 @@ fun MediaViewerScreen(
             )
         } else {
             SubcomposeAsyncImage(
-                model = coil.request.ImageRequest.Builder(LocalContext.current)
+                model = ImageRequest.Builder(LocalContext.current)
                     .data(url)
                     .diskCacheKey(currentBlob?.sha256)
                     .memoryCacheKey(currentBlob?.sha256)

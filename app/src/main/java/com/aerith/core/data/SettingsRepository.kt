@@ -67,6 +67,12 @@ class SettingsRepository(context: Context) {
 
     fun getBlobCache(): String? = prefs.getString("blob_cache", null)
 
+    fun saveTrashCache(json: String) {
+        prefs.edit().putString("trash_cache", json).apply()
+    }
+
+    fun getTrashCache(): String? = prefs.getString("trash_cache", null)
+
     fun clear() {
         prefs.edit().clear().apply()
     }

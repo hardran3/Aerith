@@ -245,28 +245,29 @@ fun GalleryScreen(
             TopAppBar(
                 title = { 
                     Row(verticalAlignment = Alignment.CenterVertically) {
-                                                // User Avatar
-                                                if (authState.profileUrl != null) {
-                                                    AsyncImage(
-                                                        model = authState.profileUrl,
-                                                        contentDescription = "Profile",
-                                                        modifier = Modifier
-                                                            .size(32.dp)
-                                                            .clip(CircleShape)
-                                                            .background(MaterialTheme.colorScheme.surfaceVariant),
-                                                        contentScale = ContentScale.Crop
-                                                    )
-                                                } else {
-                                                    Icon(
-                                                        imageVector = Icons.Default.AccountCircle,
-                                                        contentDescription = "Profile",
-                                                        modifier = Modifier
-                                                            .size(32.dp)
-                                                            .clip(CircleShape)
-                                                            .background(MaterialTheme.colorScheme.surfaceVariant),
-                                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
-                                                    )
-                                                }                        
+                        // User Avatar
+                        if (authState.profileUrl != null) {
+                            AsyncImage(
+                                model = authState.profileUrl,
+                                contentDescription = "Profile",
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                                contentScale = ContentScale.Crop
+                            )
+                        } else {
+                            Icon(
+                                imageVector = Icons.Default.AccountCircle,
+                                contentDescription = "Profile",
+                                modifier = Modifier
+                                    .size(32.dp)
+                                    .clip(CircleShape)
+                                    .background(MaterialTheme.colorScheme.surfaceVariant),
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                        
                         Spacer(modifier = Modifier.width(12.dp))
 
                         Box {
@@ -275,8 +276,11 @@ fun GalleryScreen(
                                 modifier = Modifier.clickable { showServerMenu = true }
                             ) {
                                 Text(
-                                    text = if (state.selectedServer == null) "All Media" 
-                                           else state.selectedServer?.removePrefix("https://")?.removeSuffix("/") ?: "All Media",
+                                    text = when (state.selectedServer) {
+                                        null -> "All Media"
+                                        "TRASH" -> "Trash"
+                                        else -> state.selectedServer?.removePrefix("https://")?.removeSuffix("/") ?: "All Media"
+                                    },
                                     style = MaterialTheme.typography.titleLarge
                                 )
                                 Icon(
@@ -311,13 +315,33 @@ fun GalleryScreen(
                                         }
                                     )
                                 }
+                                Divider()
+                                DropdownMenuItem(
+                                    text = { Text("Trash") },
+                                    onClick = {
+                                        galleryViewModel.selectServer("TRASH")
+                                        showServerMenu = false
+                                    },
+                                    leadingIcon = {
+                                        Icon(Icons.Default.Delete, null)
+                                    },
+                                    trailingIcon = {
+                                        if (state.selectedServer == "TRASH") Icon(Icons.Default.Check, null)
+                                    }
+                                )
                             }
                         }
                     }
                 },
                 actions = {
-                    IconButton(onClick = { triggerAuthenticatedList() }) {
-                        Icon(imageVector = Icons.Default.Refresh, contentDescription = "Refresh")
+                    if (state.selectedServer == "TRASH") {
+                        IconButton(onClick = { galleryViewModel.emptyTrash() }) {
+                            Icon(imageVector = Icons.Default.DeleteForever, contentDescription = "Empty Trash")
+                        }
+                    } else {
+                        IconButton(onClick = { triggerAuthenticatedList() }) {
+                            Icon(imageVector = Icons.Default.Refresh, contentDescription = "Refresh")
+                        }
                     }
                     IconButton(onClick = onSettingsClick) {
                         Icon(imageVector = Icons.Default.Settings, contentDescription = "Settings")
@@ -342,9 +366,9 @@ fun GalleryScreen(
                     color = MaterialTheme.colorScheme.error,
                     modifier = Modifier.align(Alignment.Center).padding(16.dp)
                 )
-            } else if (state.allBlobs.isEmpty()) {
+            } else if (state.filteredBlobs.isEmpty()) {
                 Text(
-                    text = "No media found.",
+                    text = if (state.selectedServer == "TRASH") "Trash is empty." else "No media found.",
                     modifier = Modifier.align(Alignment.Center)
                 )
             } else {
@@ -353,8 +377,14 @@ fun GalleryScreen(
                     contentPadding = PaddingValues(4.dp),
                     modifier = Modifier.fillMaxSize()
                 ) {
-                    items(state.filteredBlobs) { blob ->
-                        MediaItem(blob = blob, onClick = { onMediaClick(blob.url) })
+                    items(
+                        items = state.filteredBlobs,
+                        key = { it.sha256 } // Stable keys for high-performance scrolling
+                    ) { blob ->
+                        MediaItem(
+                            blob = blob,
+                            onClick = { onMediaClick(blob.url) }
+                        )
                     }
                 }
             }
@@ -364,7 +394,23 @@ fun GalleryScreen(
 
 @Composable
 fun MediaItem(blob: BlossomBlob, onClick: () -> Unit) {
-    val isVideo = blob.getMimeType()?.startsWith("video/") == true
+    val isVideo = remember(blob.type, blob.mime) { 
+        blob.getMimeType()?.startsWith("video/") == true 
+    }
+    val context = LocalContext.current
+    
+    // Pre-calculate image request to avoid building it every recomposition
+    val imageRequest = remember(blob.sha256, blob.url) {
+        coil.request.ImageRequest.Builder(context)
+            .data(blob.getThumbnailUrl())
+            .diskCacheKey(blob.sha256)
+            .memoryCacheKey(blob.sha256)
+            .size(400, 400)
+            .precision(coil.size.Precision.INEXACT)
+            .bitmapConfig(android.graphics.Bitmap.Config.RGB_565)
+            .crossfade(true)
+            .build()
+    }
     
     Box(
         modifier = Modifier
@@ -375,15 +421,7 @@ fun MediaItem(blob: BlossomBlob, onClick: () -> Unit) {
             .clickable { onClick() }
     ) {
         AsyncImage(
-            model = coil.request.ImageRequest.Builder(LocalContext.current)
-                .data(blob.getThumbnailUrl())
-                .diskCacheKey(blob.sha256)
-                .memoryCacheKey(blob.sha256)
-                .size(400, 400) // Don't decode full-size images for the grid
-                .precision(coil.size.Precision.INEXACT)
-                .bitmapConfig(android.graphics.Bitmap.Config.RGB_565) // Use 50% less memory per pixel
-                .crossfade(true)
-                .build(),
+            model = imageRequest,
             contentDescription = null,
             contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxSize()

@@ -15,8 +15,9 @@ import kotlinx.coroutines.launch
 data class GalleryState(
     val allBlobs: List<BlossomBlob> = emptyList(), // Source of truth
     val filteredBlobs: List<BlossomBlob> = emptyList(), // Displayed
+    val trashBlobs: List<BlossomBlob> = emptyList(), // Locally known but not on servers
     val servers: List<String> = emptyList(),
-    val selectedServer: String? = null, // null = All
+    val selectedServer: String? = null, // null = All, "TRASH" = Trash
     val isLoading: Boolean = false,
     val error: String? = null,
     
@@ -44,22 +45,34 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
     init {
         // Load from cache
+        loadFromCache()
+    }
+
+    private fun loadFromCache() {
         val cachedJson = settingsRepository.getBlobCache()
-        if (cachedJson != null) {
-            try {
-                val cachedBlobs = listAdapter.fromJson(cachedJson) ?: emptyList()
-                if (cachedBlobs.isNotEmpty()) {
-                    val uniqueServers = cachedBlobs.mapNotNull { it.serverUrl }.filter { it.isNotEmpty() }.distinct().sorted()
-                    _uiState.value = _uiState.value.copy(
-                        allBlobs = cachedBlobs,
-                        servers = uniqueServers,
-                        filteredBlobs = cachedBlobs.distinctBy { it.sha256 }
-                    )
-                }
-            } catch (e: Exception) {
-                android.util.Log.e("GalleryViewModel", "Failed to load cache", e)
+        val trashJson = settingsRepository.getTrashCache()
+        
+        var cachedBlobs = emptyList<BlossomBlob>()
+        var trashBlobs = emptyList<BlossomBlob>()
+
+        try {
+            if (cachedJson != null) {
+                cachedBlobs = listAdapter.fromJson(cachedJson) ?: emptyList()
             }
+            if (trashJson != null) {
+                trashBlobs = listAdapter.fromJson(trashJson) ?: emptyList()
+            }
+        } catch (e: Exception) {
+            android.util.Log.e("GalleryViewModel", "Failed to load cache", e)
         }
+
+        val uniqueServers = cachedBlobs.mapNotNull { it.serverUrl }.filter { it.isNotEmpty() }.distinct().sorted()
+        _uiState.value = _uiState.value.copy(
+            allBlobs = cachedBlobs,
+            trashBlobs = trashBlobs,
+            servers = uniqueServers
+        )
+        applyFilter()
     }
 
     /**
@@ -81,29 +94,76 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 mime?.startsWith("image/") == true || mime?.startsWith("video/") == true
             }
             
+            // Logic for Trash:
+            // Any blob that was in our 'allBlobs' (source of truth) but is NOT in the fresh 'mediaBlobs'
+            // should be moved to trash, unless it was already in trash.
+            val currentHashes = mediaBlobs.map { it.sha256 }.toSet()
+            val missingFromFetch = _uiState.value.allBlobs
+                .filter { it.sha256 !in currentHashes }
+                .distinctBy { it.sha256 }
+            
+            val newTrash = (_uiState.value.trashBlobs + missingFromFetch).distinctBy { it.sha256 }
             val uniqueServers = mediaBlobs.mapNotNull { it.serverUrl }.filter { it.isNotEmpty() }.distinct().sorted()
             
             _uiState.value = _uiState.value.copy(
                 allBlobs = mediaBlobs,
+                trashBlobs = newTrash,
                 servers = uniqueServers,
                 isLoading = false
             )
             applyFilter()
 
             // Save to cache
-            saveCache(mediaBlobs)
+            saveCache(mediaBlobs, newTrash)
+
+            // Proactively pre-fetch images
+            prefetchImages(mediaBlobs)
         }
     }
 
-    private fun saveCache(blobs: List<BlossomBlob>) {
-        if (blobs.isNotEmpty()) {
-            try {
-                val json = listAdapter.toJson(blobs)
-                settingsRepository.saveBlobCache(json)
-            } catch (e: Exception) {
-                android.util.Log.e("GalleryViewModel", "Failed to save cache", e)
+    private fun prefetchImages(blobs: List<BlossomBlob>) {
+        val context = getApplication<Application>()
+        val imageLoader = coil.Coil.imageLoader(context)
+        
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            blobs.filter { it.getMimeType()?.startsWith("image/") == true }.forEach { blob ->
+                // 1. Pre-fetch Thumbnail (Optimized for grid)
+                val thumbRequest = coil.request.ImageRequest.Builder(context)
+                    .data(blob.getThumbnailUrl())
+                    .diskCacheKey(blob.sha256)
+                    .memoryCacheKey(blob.sha256)
+                    .size(400, 400)
+                    .precision(coil.size.Precision.INEXACT)
+                    .bitmapConfig(android.graphics.Bitmap.Config.RGB_565)
+                    .build()
+                imageLoader.enqueue(thumbRequest)
+
+                // 2. Pre-fetch High-Res (For full screen viewer)
+                val highResRequest = coil.request.ImageRequest.Builder(context)
+                    .data(blob.url)
+                    .diskCacheKey(blob.sha256)
+                    .memoryCacheKey(blob.sha256)
+                    .build()
+                imageLoader.enqueue(highResRequest)
             }
         }
+    }
+
+    private fun saveCache(blobs: List<BlossomBlob>, trash: List<BlossomBlob>) {
+        try {
+            settingsRepository.saveBlobCache(listAdapter.toJson(blobs))
+            settingsRepository.saveTrashCache(listAdapter.toJson(trash))
+        } catch (e: Exception) {
+            android.util.Log.e("GalleryViewModel", "Failed to save cache", e)
+        }
+    }
+
+    fun emptyTrash() {
+        _uiState.value = _uiState.value.copy(trashBlobs = emptyList())
+        if (_uiState.value.selectedServer == "TRASH") {
+            applyFilter()
+        }
+        saveCache(_uiState.value.allBlobs, emptyList())
     }
 
     fun clear() {
@@ -126,10 +186,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     
     private fun applyFilter() {
         val current = _uiState.value
-        val filtered = if (current.selectedServer == null) {
-            current.allBlobs.distinctBy { it.sha256 } // Deduplicate for curated "All" view
-        } else {
-            current.allBlobs.filter { it.serverUrl == current.selectedServer }
+        val filtered = when (current.selectedServer) {
+            null -> current.allBlobs.distinctBy { it.sha256 }
+            "TRASH" -> current.trashBlobs
+            else -> current.allBlobs.filter { it.serverUrl == current.selectedServer }
         }
         _uiState.value = current.copy(filteredBlobs = filtered)
     }
@@ -151,9 +211,22 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             if (result.isSuccess) {
                 // Remove from list
                 val newAll = _uiState.value.allBlobs.filter { it != blob }
-                _uiState.value = _uiState.value.copy(allBlobs = newAll, isLoading = false)
+                
+                // If it was the last server hosting this blob, move it to trash
+                val isStillHostedElsewhere = newAll.any { it.sha256 == blob.sha256 }
+                val newTrash = if (!isStillHostedElsewhere) {
+                    (_uiState.value.trashBlobs + blob.copy(serverUrl = null)).distinctBy { it.sha256 }
+                } else {
+                    _uiState.value.trashBlobs
+                }
+
+                _uiState.value = _uiState.value.copy(
+                    allBlobs = newAll, 
+                    trashBlobs = newTrash,
+                    isLoading = false
+                )
                 applyFilter()
-                saveCache(newAll)
+                saveCache(newAll, newTrash)
             } else {
                  _uiState.value = _uiState.value.copy(isLoading = false, error = "Delete failed: ${result.exceptionOrNull()?.message}")
             }
@@ -199,8 +272,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     isLoading = false,
                     error = null
                 )
-                // Note: We don't manually add the blob here because we don't have full metadata 
-                // easily available without re-parsing the file. User should refresh.
+                // Refresh list to find new blob
             } else {
                 _uiState.value = _uiState.value.copy(
                     isLoading = false,
@@ -231,12 +303,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     serverUrl = server
                 )
                 val newAll = _uiState.value.allBlobs + newBlob
+                
+                // If we restored from trash, remove from trash
+                val newTrash = _uiState.value.trashBlobs.filter { it.sha256 != originalBlob.sha256 }
+
                 _uiState.value = _uiState.value.copy(
                     allBlobs = newAll,
+                    trashBlobs = newTrash,
                     serverMirroringStates = _uiState.value.serverMirroringStates - server
                 )
                 applyFilter()
-                saveCache(newAll)
+                saveCache(newAll, newTrash)
             } else {
                 _uiState.value = _uiState.value.copy(
                     serverMirroringStates = _uiState.value.serverMirroringStates - server,
@@ -309,9 +386,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
             if (addedBlobs.isNotEmpty()) {
                 val newAll = _uiState.value.allBlobs + addedBlobs
-                _uiState.value = _uiState.value.copy(allBlobs = newAll)
+                val newTrash = _uiState.value.trashBlobs.filter { it.sha256 != blob.sha256 }
+                _uiState.value = _uiState.value.copy(allBlobs = newAll, trashBlobs = newTrash)
                 applyFilter()
-                saveCache(newAll)
+                saveCache(newAll, newTrash)
             }
 
             if (failCount > 0) {
