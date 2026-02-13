@@ -84,9 +84,15 @@ class Nip55Signer(private val context: Context) {
     fun parseSignEventResult(intent: Intent?): String? {
         // Amber returns the full signed event JSON in "event" or "result".
         // "signature" contains only the raw sig hex — NOT what we want for NIP-98.
-        return intent?.getStringExtra("event")
+        val result = intent?.getStringExtra("event")
             ?: intent?.getStringExtra("result")
             ?: intent?.getStringExtra("signature")
+            
+        return if (result != null && result.trim().startsWith("{")) {
+            result
+        } else {
+            null
+        }
     }
 
     fun getNip04EncryptIntent(plainText: String, recipientPubkey: String, loggedInPubkey: String): Intent {

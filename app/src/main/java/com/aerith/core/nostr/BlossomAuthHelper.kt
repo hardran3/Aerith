@@ -89,18 +89,14 @@ object BlossomAuthHelper {
         val now = System.currentTimeMillis() / 1000
         val expiration = now + 3600 // 1 hour
 
-        // Order: t, expiration, p, server
+        // Order: t, expiration, server
         tags.put(JSONArray().put("t").put("list"))
         tags.put(JSONArray().put("expiration").put(expiration.toString()))
-        tags.put(JSONArray().put("p").put(pubkey))
         tags.put(JSONArray().put("server").put(serverUrl.removeSuffix("/")))
         
-        // Some servers expect mirror tag for list? (Saw this in some implementations)
-        // tags.put(JSONArray().put("t").put("mirror")) 
-        // Actually, let's stick to the strict order first but ensure created_at is fresh.
         val event = JSONObject()
         event.put("kind", 24242)
-        event.put("content", "Authorize listing files")
+        event.put("content", "")
         event.put("pubkey", pubkey)
         event.put("created_at", now - 5)
         event.put("tags", tags)

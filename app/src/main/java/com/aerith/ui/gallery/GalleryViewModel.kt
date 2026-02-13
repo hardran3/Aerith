@@ -24,8 +24,11 @@ data class GalleryState(
     val servers: List<String> = emptyList(),
     val selectedServer: String? = null, // null = All, "TRASH" = Trash
     val selectedTags: Set<String> = emptySet(),
+    val selectedHashes: Set<String> = emptySet(),
+    val lastAuthHeaders: Map<String, String> = emptyMap(),
     val fileMetadata: Map<String, List<String>> = emptyMap(), // hash -> tags
     val isLoading: Boolean = false,
+    val loadingMessage: String? = null,
     val error: String? = null,
     
     // Track which servers are currently performing a mirror operation
@@ -143,23 +146,41 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
             
             val currentHashes = mediaBlobs.map { it.sha256 }.toSet()
-            val missingFromFetch = _uiState.value.allBlobs
-                .filter { it.sha256 !in currentHashes }
-                .distinctBy { it.sha256 }
             
-            val newTrash = (_uiState.value.trashBlobs + missingFromFetch).distinctBy { it.sha256 }
+            // Trash logic: 
+            // 1. Items in existing allBlobs but missing from fresh server responses go to trash
+            val newlyMissing = _uiState.value.allBlobs
+                .filter { it.sha256 !in currentHashes }
+                .map { it.copy(serverUrl = null) }
+            
+            // 2. Combine with old trash, but REMOVE anything that is now found on a server
+            val combinedTrash = (_uiState.value.trashBlobs + newlyMissing)
+                .distinctBy { it.sha256 }
+                .filter { it.sha256 !in currentHashes }
+            
             val uniqueServers = mediaBlobs.mapNotNull { it.serverUrl }.filter { it.isNotEmpty() }.distinct().sorted()
             
-            _uiState.value = _uiState.value.copy(
-                allBlobs = mediaBlobs,
-                trashBlobs = newTrash,
-                fileMetadata = mergedMeta,
-                servers = uniqueServers,
-                isLoading = false
-            )
-            applyFilter()
-            saveCache(mediaBlobs, newTrash, mergedMeta)
-            prefetchImages(mediaBlobs)
+            // Check if anything actually changed before triggering a full UI update
+            val hasChanged = _uiState.value.allBlobs != mediaBlobs || 
+                             _uiState.value.trashBlobs != combinedTrash ||
+                             _uiState.value.lastAuthHeaders != (authHeaders.ifEmpty { _uiState.value.lastAuthHeaders }) ||
+                             _uiState.value.isLoading // if it was showing spinner, we must finish it
+
+            if (hasChanged) {
+                _uiState.value = _uiState.value.copy(
+                    allBlobs = mediaBlobs,
+                    trashBlobs = combinedTrash,
+                    fileMetadata = _uiState.value.fileMetadata + externalMetadata,
+                    lastAuthHeaders = if (authHeaders.isNotEmpty()) authHeaders else _uiState.value.lastAuthHeaders,
+                    servers = uniqueServers,
+                    isLoading = false
+                )
+                applyFilter()
+                saveCache(mediaBlobs, combinedTrash, _uiState.value.fileMetadata + externalMetadata)
+                prefetchImages(mediaBlobs)
+            } else {
+                _uiState.value = _uiState.value.copy(isLoading = false)
+            }
         }
     }
 
@@ -240,13 +261,25 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         _uiState.value = _uiState.value.copy(selectedTags = emptySet())
         applyFilter()
     }
+
+    fun toggleSelection(hash: String) {
+        val current = _uiState.value.selectedHashes
+        val next = if (current.contains(hash)) current - hash else current + hash
+        _uiState.value = _uiState.value.copy(selectedHashes = next)
+    }
+
+    fun clearSelection() {
+        _uiState.value = _uiState.value.copy(selectedHashes = emptySet())
+    }
     
     private fun applyFilter() {
         val current = _uiState.value
         var filtered = when (current.selectedServer) {
             null -> current.allBlobs.distinctBy { it.sha256 }
-            "TRASH" -> current.trashBlobs
-            else -> current.allBlobs.filter { it.serverUrl == current.selectedServer }
+            "TRASH" -> current.trashBlobs.distinctBy { it.sha256 }
+            else -> current.allBlobs
+                .filter { it.serverUrl == current.selectedServer }
+                .distinctBy { it.sha256 }
         }
 
         if (current.selectedTags.isNotEmpty()) {
@@ -358,6 +391,120 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
+    fun bulkMirrorToAll(
+        pubkey: String,
+        hashes: Set<String>,
+        allServers: List<String>,
+        signer: com.aerith.auth.Nip55Signer,
+        signerPackage: String?
+    ) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isLoading = true, loadingMessage = "Preparing to mirror...")
+            val total = hashes.size
+            var completedCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val allAddedBlobs = java.util.Collections.synchronizedList(mutableListOf<BlossomBlob>())
+
+            kotlinx.coroutines.coroutineScope {
+                hashes.forEach { hash ->
+                    launch(Dispatchers.IO) {
+                        val originalBlob = _uiState.value.allBlobs.find { it.sha256 == hash }
+                            ?: _uiState.value.trashBlobs.find { it.sha256 == hash }
+                        
+                        if (originalBlob != null) {
+                            val currentServers = _uiState.value.allBlobs.filter { it.sha256 == hash }.mapNotNull { it.serverUrl }
+                            val targetServers = allServers.filter { it !in currentServers }
+                            
+                            targetServers.forEach { server ->
+                                val unsigned = BlossomAuthHelper.createUploadAuthEvent(pubkey, hash, originalBlob.getSizeAsLong(), originalBlob.getMimeType(), null, server)
+                                val signed = if (signerPackage != null) signer.signEventBackground(signerPackage, unsigned, pubkey) else null
+                                if (signed != null) {
+                                    val result = repository.mirrorBlob(server, originalBlob.url, BlossomAuthHelper.encodeAuthHeader(signed))
+                                    if (result.isSuccess) {
+                                        allAddedBlobs.add(originalBlob.copy(url = result.getOrThrow().url, serverUrl = server))
+                                    }
+                                }
+                            }
+                        }
+                        val current = completedCount.incrementAndGet()
+                        withContext(Dispatchers.Main) {
+                            _uiState.value = _uiState.value.copy(loadingMessage = "Mirroring $current / $total...")
+                        }
+                    }
+                }
+            }
+
+            val newAll = (_uiState.value.allBlobs + allAddedBlobs).distinctBy { it.serverUrl + it.sha256 }
+            val newTrash = _uiState.value.trashBlobs.filter { t -> allAddedBlobs.none { a -> a.sha256 == t.sha256 } }
+            
+            _uiState.value = _uiState.value.copy(
+                allBlobs = newAll,
+                trashBlobs = newTrash,
+                isLoading = false,
+                loadingMessage = null,
+                selectedHashes = emptySet()
+            )
+            applyFilter()
+            saveCache(newAll, newTrash, _uiState.value.fileMetadata)
+        }
+    }
+
+    fun bulkDelete(
+        pubkey: String,
+        hashes: Set<String>,
+        signer: com.aerith.auth.Nip55Signer,
+        signerPackage: String?
+    ) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isLoading = true, loadingMessage = "Preparing to delete...")
+            val total = hashes.size
+            val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val newTrashList = java.util.Collections.synchronizedList(_uiState.value.trashBlobs.toMutableList())
+            val remainingAllBlobs = java.util.Collections.synchronizedList(_uiState.value.allBlobs.toMutableList())
+
+            kotlinx.coroutines.coroutineScope {
+                hashes.forEach { hash ->
+                    launch(Dispatchers.IO) {
+                        // Find all server instances of this hash
+                        val instances = _uiState.value.allBlobs.filter { it.sha256 == hash }
+                        
+                        instances.forEach { blob ->
+                            val server = blob.serverUrl ?: return@forEach
+                            val unsigned = BlossomAuthHelper.createDeleteAuthEvent(pubkey, hash, server)
+                            val signed = if (signerPackage != null) signer.signEventBackground(signerPackage, unsigned, pubkey) else null
+                            
+                            if (signed != null) {
+                                repository.deleteBlob(server, hash, BlossomAuthHelper.encodeAuthHeader(signed))
+                            }
+                        }
+
+                        // Move one instance to trash (without server URL) and remove from allBlobs
+                        val representative = instances.firstOrNull() ?: _uiState.value.allBlobs.find { it.sha256 == hash }
+                        if (representative != null) {
+                            newTrashList.add(representative.copy(serverUrl = null))
+                        }
+                        remainingAllBlobs.removeAll { it.sha256 == hash }
+
+                        val current = completedCount.incrementAndGet()
+                        withContext(Dispatchers.Main) {
+                            _uiState.value = _uiState.value.copy(loadingMessage = "Deleting $current / $total...")
+                        }
+                    }
+                }
+            }
+
+            val finalTrash = newTrashList.distinctBy { it.sha256 }
+            _uiState.value = _uiState.value.copy(
+                allBlobs = remainingAllBlobs.toList(),
+                trashBlobs = finalTrash,
+                isLoading = false,
+                loadingMessage = null,
+                selectedHashes = emptySet()
+            )
+            applyFilter()
+            saveCache(remainingAllBlobs.toList(), finalTrash, _uiState.value.fileMetadata)
+        }
+    }
+
     // --- LABELS (Kind 1063) ---
     fun updateLabels(
         pubkey: String,
@@ -430,6 +577,87 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 )
                 applyFilter()
                 saveCache(updatedBlobs, _uiState.value.trashBlobs, newMeta)
+            }
+        }
+    }
+
+    fun bulkUpdateLabels(
+        pubkey: String,
+        relays: List<String>,
+        hashes: Set<String>,
+        newTags: List<String>,
+        signer: com.aerith.auth.Nip55Signer,
+        signerPackage: String?
+    ) {
+        viewModelScope.launch {
+            _uiState.value = _uiState.value.copy(isLoading = true, loadingMessage = "Preparing to update labels...")
+            val total = hashes.size
+            val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val updatedMetadata = java.util.Collections.synchronizedMap(_uiState.value.fileMetadata.toMutableMap())
+
+            kotlinx.coroutines.coroutineScope {
+                hashes.forEach { hash ->
+                    launch(Dispatchers.IO) {
+                        val blob = _uiState.value.allBlobs.find { it.sha256 == hash }
+                        if (blob != null) {
+                            // 1. Create and Sign Kind 1063
+                            val unsigned = BlossomAuthHelper.createFileMetadataEvent(
+                                pubkey, hash, blob.url, blob.getMimeType(), newTags
+                            )
+                            val signed = if (signerPackage != null) {
+                                signer.signEventBackground(signerPackage, unsigned, pubkey)
+                            } else null
+
+                            if (signed != null) {
+                                // 2. Publish to relays
+                                relays.forEach { url ->
+                                    try { RelayClient(url).publishEvent(signed) } catch (e: Exception) {}
+                                }
+
+                                // 3. Mirror to server
+                                val server = blob.serverUrl
+                                if (server != null) {
+                                    val unsignedMirror = BlossomAuthHelper.createUploadAuthEvent(
+                                        pubkey, hash, blob.getSizeAsLong(), blob.getMimeType(), null, server
+                                    )
+                                    val mirrorEventObj = JSONObject(unsignedMirror)
+                                    val tagsArr = mirrorEventObj.getJSONArray("tags")
+                                    newTags.forEach { tag -> tagsArr.put(JSONArray().put("t").put(tag)) }
+                                    
+                                    val signedMirror = signer.signEventBackground(signerPackage!!, mirrorEventObj.toString(), pubkey)
+                                    if (signedMirror != null) {
+                                        repository.mirrorBlob(server, blob.url, BlossomAuthHelper.encodeAuthHeader(signedMirror))
+                                    }
+                                }
+                                updatedMetadata[hash] = newTags
+                            }
+                        }
+                        
+                        val current = completedCount.incrementAndGet()
+                        withContext(Dispatchers.Main) {
+                            _uiState.value = _uiState.value.copy(loadingMessage = "Updating labels $current / $total...")
+                        }
+                    }
+                }
+            }
+
+            withContext(Dispatchers.Main) {
+                val finalMeta = updatedMetadata.toMap()
+                val updatedBlobs = _uiState.value.allBlobs.map { b ->
+                    if (b.sha256 in hashes) {
+                        b.copy(nip94 = newTags.map { listOf("t", it) })
+                    } else b
+                }
+                
+                _uiState.value = _uiState.value.copy(
+                    allBlobs = updatedBlobs,
+                    fileMetadata = finalMeta,
+                    selectedHashes = emptySet(),
+                    isLoading = false,
+                    loadingMessage = null
+                )
+                applyFilter()
+                saveCache(updatedBlobs, _uiState.value.trashBlobs, finalMeta)
             }
         }
     }

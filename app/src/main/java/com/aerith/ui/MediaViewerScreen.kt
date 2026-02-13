@@ -1,6 +1,9 @@
 package com.aerith.ui
 
 import android.app.Activity
+import android.content.Context
+import android.content.Intent
+import android.net.Uri
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
@@ -19,6 +22,7 @@ import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
 import androidx.media3.common.MediaItem
 import androidx.media3.common.Player
@@ -27,6 +31,7 @@ import androidx.media3.datasource.cache.CacheDataSource
 import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
 import androidx.media3.ui.PlayerView
+import coil.ImageLoader
 import coil.compose.SubcomposeAsyncImage
 import coil.request.ImageRequest
 import com.aerith.AerithApp
@@ -34,6 +39,10 @@ import com.aerith.auth.AuthState
 import com.aerith.auth.Nip55Signer
 import com.aerith.core.nostr.BlossomAuthHelper
 import com.aerith.ui.gallery.GalleryViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import java.io.File
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
@@ -44,15 +53,14 @@ fun MediaViewerScreen(
 ) {
     val uiState by galleryViewModel.uiState.collectAsState()
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
     val signer = remember { Nip55Signer(context) }
     
-    // Find the blob for the current URL (search both active and trash)
     val currentBlob = remember(uiState.allBlobs, uiState.trashBlobs, url) { 
         uiState.allBlobs.find { it.url == url } ?: uiState.trashBlobs.find { it.url == url }
     }
     val isVideo = remember(currentBlob) { currentBlob?.getMimeType()?.startsWith("video/") == true }
 
-    // ExoPlayer setup with caching
     val exoPlayer = remember {
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("Aerith/1.0")
@@ -85,7 +93,6 @@ fun MediaViewerScreen(
         }
     }
     
-    // Find all blobs with the same SHA256 (same file, different servers)
     val relatedBlobs = remember(uiState.allBlobs, currentBlob) {
         if (currentBlob != null) {
             uiState.allBlobs.filter { it.sha256 == currentBlob.sha256 }
@@ -99,7 +106,6 @@ fun MediaViewerScreen(
     val infoSheetState = rememberModalBottomSheetState()
     val serverSheetState = rememberModalBottomSheetState()
     
-    // Signer State
     var blobToDelete by remember { mutableStateOf<com.aerith.core.blossom.BlossomBlob?>(null) }
     var pendingMirrorServer by remember { mutableStateOf<String?>(null) }
     var pendingLabelUpdateTags by remember { mutableStateOf<List<String>?>(null) }
@@ -121,6 +127,66 @@ fun MediaViewerScreen(
                     galleryViewModel.updateLabels(pk, authState.relays, currentBlob, pendingLabelUpdateTags!!, signedJson, signer, authState.signerPackage)
                     pendingLabelUpdateTags = null
                 }
+            }
+        }
+    }
+
+    fun shareMedia(context: Context, url: String, mimeType: String, hash: String) {
+        scope.launch(Dispatchers.IO) {
+            try {
+                // 1. Try to get from Coil Disk Cache (for images)
+                var file: File? = null
+                if (!mimeType.startsWith("video/")) {
+                    val imageLoader = coil.Coil.imageLoader(context)
+                    val snapshot = imageLoader.diskCache?.get(hash)
+                    file = snapshot?.data?.toFile()
+                }
+
+                // 2. If not in cache or is video, download to a temp file for sharing
+                if (file == null || !file.exists()) {
+                    val tempFile = File(context.cacheDir, "temp_share_${System.currentTimeMillis()}.${mimeType.substringAfter("/")}")
+                    try {
+                        val request = okhttp3.Request.Builder().url(url).build()
+                        val client = okhttp3.OkHttpClient()
+                        client.newCall(request).execute().use { response ->
+                            if (response.isSuccessful) {
+                                response.body?.byteStream()?.use { input ->
+                                    tempFile.outputStream().use { output ->
+                                        input.copyTo(output)
+                                    }
+                                }
+                                file = tempFile
+                            }
+                        }
+                    } catch (e: Exception) {
+                        android.util.Log.e("MediaViewer", "Download for share failed", e)
+                    }
+                }
+
+                if (file != null && file!!.exists()) {
+                    val sharedFile = File(context.cacheDir, "shared_media.${mimeType.substringAfter("/")}")
+                    file!!.copyTo(sharedFile, overwrite = true)
+                    
+                    val contentUri = FileProvider.getUriForFile(context, "${context.packageName}.fileprovider", sharedFile)
+                    
+                    val intent = Intent(Intent.ACTION_SEND).apply {
+                        type = mimeType
+                        putExtra(Intent.EXTRA_STREAM, contentUri)
+                        addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                    }
+                    context.startActivity(Intent.createChooser(intent, "Share Media"))
+                } else {
+                    // Final fallback to URL
+                    withContext(Dispatchers.Main) {
+                        val intent = Intent(Intent.ACTION_SEND).apply {
+                            type = "text/plain"
+                            putExtra(Intent.EXTRA_TEXT, url)
+                        }
+                        context.startActivity(Intent.createChooser(intent, "Share Media Link"))
+                    }
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("MediaViewer", "Failed to share media", e)
             }
         }
     }
@@ -172,13 +238,9 @@ fun MediaViewerScreen(
             // Share Button
             IconButton(
                 onClick = {
-                    val sendIntent = android.content.Intent().apply {
-                        action = android.content.Intent.ACTION_SEND
-                        putExtra(android.content.Intent.EXTRA_TEXT, url)
-                        type = "text/plain"
+                    if (currentBlob != null) {
+                        shareMedia(context, url, currentBlob.getMimeType() ?: "image/*", currentBlob.sha256)
                     }
-                    val shareIntent = android.content.Intent.createChooser(sendIntent, "Share Media Link")
-                    context.startActivity(shareIntent)
                 }
             ) {
                 Icon(Icons.Default.Share, "Share", tint = Color.White)
@@ -351,50 +413,66 @@ fun MediaViewerScreen(
                                 if (pk != null) {
                                     val isMirroring = uiState.serverMirroringStates[server] ?: false
                                     
-                                    if (isMirroring) {
-                                        CircularProgressIndicator(
-                                            modifier = Modifier.size(24.dp),
-                                            strokeWidth = 2.dp
-                                        )
-                                    } else if (isOnServer) {
-                                        val blobOnServer = relatedBlobs.find { it.serverUrl == server }!!
-                                        IconButton(
-                                            onClick = {
-                                                val eventJson = galleryViewModel.prepareDeleteEvent(pk, blobOnServer)
-                                                if (eventJson != null) {
-                                                    val signed = if (pkg != null) signer.signEventBackground(pkg, eventJson, pk) else null
-                                                    if (signed != null) {
-                                                        galleryViewModel.deleteBlob(blobOnServer, signed)
-                                                    } else {
-                                                        blobToDelete = blobOnServer
-                                                        signLauncher.launch(signer.getSignEventIntent(eventJson, pk))
+                                    Row {
+                                        if (isOnServer) {
+                                            val blobOnServer = relatedBlobs.find { it.serverUrl == server }!!
+                                            IconButton(
+                                                onClick = {
+                                                    val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                                                    val clip = android.content.ClipData.newPlainText("Media Link", blobOnServer.url)
+                                                    clipboard.setPrimaryClip(clip)
+                                                    android.widget.Toast.makeText(context, "Link copied to clipboard", android.widget.Toast.LENGTH_SHORT).show()
+                                                }
+                                            ) {
+                                                Icon(Icons.Default.ContentCopy, "Copy Link", tint = MaterialTheme.colorScheme.secondary)
+                                            }
+                                        }
+
+                                        if (isMirroring) {
+                                            CircularProgressIndicator(
+                                                modifier = Modifier.size(24.dp).padding(4.dp),
+                                                strokeWidth = 2.dp
+                                            )
+                                        } else if (isOnServer) {
+                                            val blobOnServer = relatedBlobs.find { it.serverUrl == server }!!
+                                            IconButton(
+                                                onClick = {
+                                                    val eventJson = galleryViewModel.prepareDeleteEvent(pk, blobOnServer)
+                                                    if (eventJson != null) {
+                                                        val signed = if (pkg != null) signer.signEventBackground(pkg, eventJson, pk) else null
+                                                        if (signed != null) {
+                                                            galleryViewModel.deleteBlob(blobOnServer, signed)
+                                                        } else {
+                                                            blobToDelete = blobOnServer
+                                                            signLauncher.launch(signer.getSignEventIntent(eventJson, pk))
+                                                        }
                                                     }
                                                 }
+                                            ) {
+                                                Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.error)
                                             }
-                                        ) {
-                                            Icon(Icons.Default.Delete, "Delete", tint = MaterialTheme.colorScheme.error)
-                                        }
-                                    } else {
-                                        IconButton(
-                                            onClick = {
-                                                val unsigned = BlossomAuthHelper.createUploadAuthEvent(
-                                                    pubkey = pk,
-                                                    sha256 = currentBlob.sha256,
-                                                    size = currentBlob.getSizeAsLong(),
-                                                    mimeType = currentBlob.getMimeType(),
-                                                    fileName = null,
-                                                    serverUrl = server
-                                                )
-                                                val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
-                                                if (signed != null) {
-                                                    galleryViewModel.mirrorBlob(server, url, signed, currentBlob)
-                                                } else {
-                                                    pendingMirrorServer = server
-                                                    signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
+                                        } else {
+                                            IconButton(
+                                                onClick = {
+                                                    val unsigned = BlossomAuthHelper.createUploadAuthEvent(
+                                                        pubkey = pk,
+                                                        sha256 = currentBlob.sha256,
+                                                        size = currentBlob.getSizeAsLong(),
+                                                        mimeType = currentBlob.getMimeType(),
+                                                        fileName = null,
+                                                        serverUrl = server
+                                                    )
+                                                    val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
+                                                    if (signed != null) {
+                                                        galleryViewModel.mirrorBlob(server, url, signed, currentBlob)
+                                                    } else {
+                                                        pendingMirrorServer = server
+                                                        signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
+                                                    }
                                                 }
+                                            ) {
+                                                Icon(Icons.Default.CloudUpload, "Mirror to this server", tint = MaterialTheme.colorScheme.primary)
                                             }
-                                        ) {
-                                            Icon(Icons.Default.CloudUpload, "Mirror to this server", tint = MaterialTheme.colorScheme.primary)
                                         }
                                     }
                                 }
