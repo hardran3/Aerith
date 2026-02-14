@@ -9,6 +9,7 @@ import com.aerith.core.blossom.BlossomRepository
 import com.aerith.core.network.RelayClient
 import com.aerith.core.nostr.BlossomAuthHelper
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -36,7 +37,7 @@ data class GalleryState(
     val isServerBadgeEnabled: Boolean = true,
     val isFileTypeBadgeEnabled: Boolean = true,
     val lastAuthHeaders: Map<String, String> = emptyMap(),
-    val fileMetadata: Map<String, List<String>> = emptyMap(), // hash -> tags
+    val fileMetadata: Map<String, List<List<String>>> = emptyMap(), // hash -> List of tags [["t", "tag"], ["name", "file"]]
     val isLoading: Boolean = false,
     val loadingMessage: String? = null,
     val error: String? = null,
@@ -100,7 +101,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         
         var cachedBlobs = emptyList<BlossomBlob>()
         var trashBlobs = emptyList<BlossomBlob>()
-        var fileMetadata = emptyMap<String, List<String>>()
+        var fileMetadata = emptyMap<String, List<List<String>>>()
 
         try {
             if (cachedJson != null) {
@@ -111,14 +112,25 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
             if (metaJson != null) {
                 val json = JSONObject(metaJson)
-                val map = mutableMapOf<String, List<String>>()
+                val map = mutableMapOf<String, List<List<String>>>()
                 json.keys().forEach { hash ->
                     val arr = json.getJSONArray(hash)
-                    val tags = mutableListOf<String>()
+                    val tagsList = mutableListOf<List<String>>()
                     for (i in 0 until arr.length()) {
-                        tags.add(arr.getString(i))
+                        try {
+                            // New format: hash -> [["t", "tag"], ["name", "file"]]
+                            val tagArr = arr.getJSONArray(i)
+                            val tagFields = mutableListOf<String>()
+                            for (j in 0 until tagArr.length()) {
+                                tagFields.add(tagArr.getString(j))
+                            }
+                            tagsList.add(tagFields)
+                        } catch (e: Exception) {
+                            // Fallback for old format: hash -> ["tag1", "tag2"]
+                            tagsList.add(listOf("t", arr.getString(i)))
+                        }
                     }
-                    map[hash] = tags
+                    map[hash] = tagsList
                 }
                 fileMetadata = map
             }
@@ -139,15 +151,15 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         applyFilter()
     }
 
-    fun refreshMetadataOnly(externalMetadata: Map<String, List<String>>) {
+    fun refreshMetadataOnly(externalMetadata: Map<String, List<List<String>>>) {
         if (externalMetadata.isEmpty()) return
         
         val mergedMeta = (externalMetadata + _uiState.value.fileMetadata).toMutableMap()
         val updatedBlobs = _uiState.value.allBlobs.map { blob ->
             val normalizedHash = blob.sha256.lowercase()
-            val tags = mergedMeta[normalizedHash] ?: mergedMeta[blob.sha256] ?: blob.getTags()
+            val tags = mergedMeta[normalizedHash] ?: mergedMeta[blob.sha256] ?: blob.nip94 as? List<List<String>> ?: emptyList()
             if (tags.isNotEmpty()) {
-                blob.copy(nip94 = tags.map { listOf("t", it) })
+                blob.copy(nip94 = tags)
             } else {
                 blob
             }
@@ -155,9 +167,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
         val updatedTrash = _uiState.value.trashBlobs.map { blob ->
             val normalizedHash = blob.sha256.lowercase()
-            val tags = mergedMeta[normalizedHash] ?: mergedMeta[blob.sha256] ?: blob.getTags()
+            val tags = mergedMeta[normalizedHash] ?: mergedMeta[blob.sha256] ?: blob.nip94 as? List<List<String>> ?: emptyList()
             if (tags.isNotEmpty()) {
-                blob.copy(nip94 = tags.map { listOf("t", it) })
+                blob.copy(nip94 = tags)
             } else {
                 blob
             }
@@ -179,7 +191,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         pubkey: String, 
         servers: List<String>, 
         authHeaders: Map<String, String> = emptyMap(),
-        externalMetadata: Map<String, List<String>> = emptyMap(),
+        externalMetadata: Map<String, List<List<String>>> = emptyMap(),
         localBlossomUrl: String? = null
     ) {
         // Only fetch from remote servers. Local cache is handled as an overlay.
@@ -220,9 +232,9 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
             mediaBlobs = mediaBlobs.map { blob ->
                 val normalizedHash = blob.sha256.lowercase()
-                val tags = mergedMeta[normalizedHash] ?: mergedMeta[blob.sha256] ?: blob.getTags()
+                val tags = mergedMeta[normalizedHash] ?: mergedMeta[blob.sha256] ?: blob.nip94 as? List<List<String>> ?: emptyList()
                 if (tags.isNotEmpty()) {
-                    blob.copy(nip94 = tags.map { listOf("t", it) })
+                    blob.copy(nip94 = tags)
                 } else {
                     blob
                 }
@@ -344,16 +356,20 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         }
     }
 
-    private fun saveCache(blobs: List<BlossomBlob>, trash: List<BlossomBlob>, metadata: Map<String, List<String>>) {
+    private fun saveCache(blobs: List<BlossomBlob>, trash: List<BlossomBlob>, metadata: Map<String, List<List<String>>>) {
         try {
             settingsRepository.saveBlobCache(listAdapter.toJson(blobs))
             settingsRepository.saveTrashCache(listAdapter.toJson(trash))
             
             val metaObj = JSONObject()
-            metadata.forEach { (h, t) ->
-                val arr = JSONArray()
-                t.forEach { arr.put(it) }
-                metaObj.put(h, arr)
+            metadata.forEach { (h, tagsList) ->
+                val tagsArray = JSONArray()
+                tagsList.forEach { tag ->
+                    val tagArray = JSONArray()
+                    tag.forEach { tagArray.put(it) }
+                    tagsArray.put(tagArray)
+                }
+                metaObj.put(h, tagsArray)
             }
             settingsRepository.saveFileMetadataCache(metaObj.toString())
         } catch (e: Exception) {
@@ -615,34 +631,34 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isLoading = true, loadingMessage = "Preparing to mirror...")
             val total = hashes.size
-            var completedCount = java.util.concurrent.atomic.AtomicInteger(0)
+            val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
             val allAddedBlobs = java.util.Collections.synchronizedList(mutableListOf<BlossomBlob>())
             
-            // Limit concurrency to avoid network/server congestion
-            val semaphore = kotlinx.coroutines.sync.Semaphore(3)
-
             kotlinx.coroutines.coroutineScope {
                 hashes.forEach { hash ->
                     launch(Dispatchers.IO) {
-                        semaphore.withPermit {
-                            val originalBlob = _uiState.value.allBlobs.find { it.sha256 == hash }
-                                ?: _uiState.value.trashBlobs.find { it.sha256 == hash }
+                        val originalBlob = _uiState.value.allBlobs.find { it.sha256 == hash }
+                            ?: _uiState.value.trashBlobs.find { it.sha256 == hash }
+                        
+                        if (originalBlob != null) {
+                            val currentServers = _uiState.value.allBlobs.filter { it.sha256 == hash }.mapNotNull { it.serverUrl }
+                            val targetServers = allServers.filter { it !in currentServers }
                             
-                            if (originalBlob != null) {
-                                val currentServers = _uiState.value.allBlobs.filter { it.sha256 == hash }.mapNotNull { it.serverUrl }
-                                val targetServers = allServers.filter { it !in currentServers }
-                                
-                                // Special case: Local Cache (no signing needed)
-                                if (localBlossomUrl != null && localBlossomUrl !in currentServers) {
+                            // 1. Local Cache Mirror (Async)
+                            val localMirrorJob = if (localBlossomUrl != null && localBlossomUrl !in currentServers) {
+                                launch {
                                     val result = repository.fetchToLocalCache(hash, originalBlob.url, localBlossomUrl)
                                     if (result.isSuccess) {
                                         allAddedBlobs.add(originalBlob.copy(url = "$localBlossomUrl/$hash", serverUrl = localBlossomUrl))
                                     }
                                 }
+                            } else null
 
-                                targetServers.forEach { server ->
-                                    if (server == localBlossomUrl) return@forEach
-                                    val unsigned = BlossomAuthHelper.createUploadAuthEvent(pubkey, hash, originalBlob.getSizeAsLong(), originalBlob.getMimeType(), null, server)
+                            // 2. Remote Server Mirrors (Parallel)
+                            targetServers.forEach { server ->
+                                if (server == localBlossomUrl) return@forEach
+                                launch {
+                                    val unsigned = BlossomAuthHelper.createUploadAuthEvent(pubkey, hash, originalBlob.getSizeAsLong(), originalBlob.getMimeType(), originalBlob.getName(_uiState.value.fileMetadata), server)
                                     val signed = if (signerPackage != null) signer.signEventBackground(signerPackage, unsigned, pubkey) else null
                                     if (signed != null) {
                                         val result = repository.mirrorBlob(server, originalBlob.url, BlossomAuthHelper.encodeAuthHeader(signed))
@@ -652,10 +668,10 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                                     }
                                 }
                             }
-                            val current = completedCount.incrementAndGet()
-                            withContext(Dispatchers.Main) {
-                                _uiState.value = _uiState.value.copy(loadingMessage = "Mirroring $current / $total...")
-                            }
+                        }
+                        val current = completedCount.incrementAndGet()
+                        withContext(Dispatchers.Main) {
+                            _uiState.value = _uiState.value.copy(loadingMessage = "Mirroring $current / $total...")
                         }
                     }
                 }
@@ -679,6 +695,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun bulkDelete(
         pubkey: String,
         hashes: Set<String>,
+        targetServers: List<String>,
         signer: com.aerith.auth.Nip55Signer,
         signerPackage: String?
     ) {
@@ -687,30 +704,29 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             val total = hashes.size
             val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
             
-            // Collect items to add to trash safely
-            val deletedBlobs = java.util.Collections.synchronizedList(mutableListOf<BlossomBlob>())
+            // Collect items that were fully removed from selected servers
+            val deletedInstances = java.util.Collections.synchronizedList(mutableListOf<Pair<String, String>>()) // hash, server
 
             kotlinx.coroutines.coroutineScope {
                 hashes.forEach { hash ->
                     launch(Dispatchers.IO) {
-                        // Find all server instances of this hash
-                        val instances = _uiState.value.allBlobs.filter { it.sha256 == hash }
+                        // Find all server instances of this hash that are in our target list
+                        val instancesToDelete = _uiState.value.allBlobs.filter { it.sha256 == hash && it.serverUrl in targetServers }
                         
-                        instances.forEach { blob ->
-                            val server = blob.serverUrl ?: return@forEach
-                            val unsigned = BlossomAuthHelper.createDeleteAuthEvent(pubkey, hash, server)
-                            val signed = if (signerPackage != null) signer.signEventBackground(signerPackage, unsigned, pubkey) else null
-                            
-                            if (signed != null) {
-                                repository.deleteBlob(server, hash, BlossomAuthHelper.encodeAuthHeader(signed))
+                        // Delete from selected servers in parallel
+                        instancesToDelete.map { blob ->
+                            launch {
+                                val server = blob.serverUrl ?: return@launch
+                                val unsigned = BlossomAuthHelper.createDeleteAuthEvent(pubkey, hash, server)
+                                val signed = if (signerPackage != null) signer.signEventBackground(signerPackage, unsigned, pubkey) else null
+                                
+                                if (signed != null) {
+                                    val result = repository.deleteBlob(server, hash, authHeader = BlossomAuthHelper.encodeAuthHeader(signed))
+                                    if (result.isSuccess) {
+                                        deletedInstances.add(hash to server)
+                                    }
+                                }
                             }
-                        }
-
-                        // Save one representative for trash
-                        val representative = instances.firstOrNull() ?: _uiState.value.allBlobs.find { it.sha256 == hash }
-                        if (representative != null) {
-                            cacheManager.pinToPersistentStorage(hash)
-                            deletedBlobs.add(representative.copy(serverUrl = null))
                         }
 
                         val current = completedCount.incrementAndGet()
@@ -721,19 +737,31 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
 
-            // Perform final state update on Main thread after all parallel tasks finish
-            val finalAllBlobs = _uiState.value.allBlobs.filter { it.sha256 !in hashes }
-            val finalTrash = (_uiState.value.trashBlobs + deletedBlobs).distinctBy { it.sha256 }
+            // Perform final state update on Main thread
+            val deletedHashesAndServers = deletedInstances.toSet()
+            val newAllBlobs = _uiState.value.allBlobs.filter { (it.sha256 to it.serverUrl) !in deletedHashesAndServers }
+            
+            // Files that are no longer on ANY remote server should move to trash
+            val remainingRemoteHashes = newAllBlobs.map { it.sha256 }.toSet()
+            val fullyRemovedHashes = hashes.filter { it !in remainingRemoteHashes }
+            
+            val newTrash = (_uiState.value.trashBlobs + fullyRemovedHashes.mapNotNull { hash ->
+                val representative = _uiState.value.allBlobs.find { it.sha256 == hash }
+                if (representative != null) {
+                    cacheManager.pinToPersistentStorage(hash)
+                    representative.copy(serverUrl = null)
+                } else null
+            }).distinctBy { it.sha256 }
             
             _uiState.value = _uiState.value.copy(
-                allBlobs = finalAllBlobs,
-                trashBlobs = finalTrash,
+                allBlobs = newAllBlobs,
+                trashBlobs = newTrash,
                 isLoading = false,
                 loadingMessage = null,
                 selectedHashes = emptySet()
             )
             applyFilter()
-            saveCache(finalAllBlobs, finalTrash, _uiState.value.fileMetadata)
+            saveCache(newAllBlobs, newTrash, _uiState.value.fileMetadata)
             refreshPinnedHashes()
         }
     }
@@ -746,17 +774,31 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         newTags: List<String>,
         signedKind1063Json: String,
         signer: com.aerith.auth.Nip55Signer,
-        signerPackage: String?
+        signerPackage: String?,
+        newName: String? = null
     ) {
         android.util.Log.d("GalleryViewModel", "updateLabels started for ${blob.sha256}")
         
         // 1. Optimistic Update: Update state immediately on Main thread
         val currentMeta = _uiState.value.fileMetadata.toMutableMap()
-        currentMeta[blob.sha256] = newTags
         
         val optimisticallyUpdatedBlobs = _uiState.value.allBlobs.map { b ->
             if (b.sha256 == blob.sha256) {
-                b.copy(nip94 = newTags.map { listOf("t", it) })
+                val newNip94 = newTags.map { listOf("t", it) }.toMutableList()
+                if (newName != null) {
+                    newNip94.add(listOf("name", newName))
+                } else {
+                    // Preserve existing name if it exists
+                    val existingName = b.getName(_uiState.value.fileMetadata)
+                    if (existingName != null) {
+                        newNip94.add(listOf("name", existingName))
+                    }
+                }
+                
+                // Update map for persistence
+                currentMeta[blob.sha256] = newNip94
+                
+                b.copy(nip94 = newNip94)
             } else b
         }
         
@@ -766,44 +808,50 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         )
         applyFilter()
 
-        // 2. Perform network operations in background
+        // 2. Perform network operations in parallel
         viewModelScope.launch(Dispatchers.IO) {
             _uiState.value = _uiState.value.copy(isLoading = true)
             
-            // Publish Kind 1063 to relays
-            relays.forEach { url ->
-                try {
-                    val client = RelayClient(url)
-                    client.publishEvent(signedKind1063Json)
-                } catch (e: Exception) { 
-                    android.util.Log.e("GalleryViewModel", "Failed to publish to $url", e)
+            coroutineScope {
+                // Parallelize Relay Publishing
+                relays.forEach { url ->
+                    launch {
+                        try {
+                            val client = RelayClient(url)
+                            client.publishEvent(signedKind1063Json)
+                        } catch (e: Exception) { 
+                            android.util.Log.e("GalleryViewModel", "Failed to publish to $url", e)
+                        }
+                    }
                 }
-            }
 
-            // Mirror to current server with updated tags
-            val server = blob.serverUrl
-            if (server != null) {
-                val unsignedMirror = BlossomAuthHelper.createUploadAuthEvent(
-                    pubkey = pubkey,
-                    sha256 = blob.sha256,
-                    size = blob.getSizeAsLong(),
-                    mimeType = blob.getMimeType(),
-                    fileName = null,
-                    serverUrl = server
-                )
-                
-                val mirrorEventObj = JSONObject(unsignedMirror)
-                val tagsArr = mirrorEventObj.getJSONArray("tags")
-                newTags.forEach { tag ->
-                    tagsArr.put(JSONArray().put("t").put(tag))
-                }
-                
-                val signedMirror = if (signerPackage != null) {
-                    signer.signEventBackground(signerPackage, mirrorEventObj.toString(), pubkey)
-                } else null
+                // Mirror to current server with updated tags
+                val server = blob.serverUrl
+                if (server != null) {
+                    launch {
+                        val unsignedMirror = BlossomAuthHelper.createUploadAuthEvent(
+                            pubkey = pubkey,
+                            sha256 = blob.sha256,
+                            size = blob.getSizeAsLong(),
+                            mimeType = blob.getMimeType(),
+                            fileName = newName ?: blob.getName(_uiState.value.fileMetadata),
+                            serverUrl = server
+                        )
+                        
+                        val mirrorEventObj = JSONObject(unsignedMirror)
+                        val tagsArr = mirrorEventObj.getJSONArray("tags")
+                        newTags.forEach { tag ->
+                            tagsArr.put(JSONArray().put("t").put(tag))
+                        }
+                        
+                        val signedMirror = if (signerPackage != null) {
+                            signer.signEventBackground(signerPackage, mirrorEventObj.toString(), pubkey)
+                        } else null
 
-                if (signedMirror != null) {
-                    repository.mirrorBlob(server, blob.url, BlossomAuthHelper.encodeAuthHeader(signedMirror))
+                        if (signedMirror != null) {
+                            repository.mirrorBlob(server, blob.url, BlossomAuthHelper.encodeAuthHeader(signedMirror))
+                        }
+                    }
                 }
             }
 
@@ -837,38 +885,50 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                         if (blob != null) {
                             // Merge with existing tags
                             val currentTags = blob.getTags(_uiState.value.fileMetadata)
-                            val combinedTags = (currentTags + newTags).distinct()
+                            val combinedLabels = (currentTags + newTags).distinct()
+                            
+                            // Build full tag list preserving other NIP-94 tags (like name)
+                            val existingNip94 = (blob.nip94 as? List<*>)?.filterIsInstance<List<String>>() ?: emptyList()
+                            val otherTags = existingNip94.filter { it.firstOrNull() != "t" }
+                            val newNip94 = otherTags + combinedLabels.map { listOf("t", it) }
 
                             // 1. Create and Sign Kind 1063
                             val unsigned = BlossomAuthHelper.createFileMetadataEvent(
-                                pubkey, hash, blob.url, blob.getMimeType(), combinedTags
+                                pubkey, hash, blob.url, blob.getMimeType(), combinedLabels,
+                                name = blob.getName(_uiState.value.fileMetadata)
                             )
                             val signed = if (signerPackage != null) {
                                 signer.signEventBackground(signerPackage, unsigned, pubkey)
                             } else null
 
                             if (signed != null) {
-                                // 2. Publish to relays
-                                relays.forEach { url ->
-                                    try { RelayClient(url).publishEvent(signed) } catch (e: Exception) {}
-                                }
-
-                                // 3. Mirror to server
-                                val server = blob.serverUrl
-                                if (server != null) {
-                                    val unsignedMirror = BlossomAuthHelper.createUploadAuthEvent(
-                                        pubkey, hash, blob.getSizeAsLong(), blob.getMimeType(), null, server
-                                    )
-                                    val mirrorEventObj = JSONObject(unsignedMirror)
-                                    val tagsArr = mirrorEventObj.getJSONArray("tags")
-                                    combinedTags.forEach { tag -> tagsArr.put(JSONArray().put("t").put(tag)) }
-                                    
-                                    val signedMirror = signer.signEventBackground(signerPackage!!, mirrorEventObj.toString(), pubkey)
-                                    if (signedMirror != null) {
-                                        repository.mirrorBlob(server, blob.url, BlossomAuthHelper.encodeAuthHeader(signedMirror))
+                                // 2. Parallel Tasks: Publish to relays and Mirror to server
+                                launch {
+                                    relays.forEach { url ->
+                                        launch {
+                                            try { RelayClient(url).publishEvent(signed) } catch (e: Exception) {}
+                                        }
                                     }
                                 }
-                                updatedMetadata[hash] = combinedTags
+
+                                launch {
+                                    // 3. Mirror to server
+                                    val server = blob.serverUrl
+                                    if (server != null) {
+                                        val unsignedMirror = BlossomAuthHelper.createUploadAuthEvent(
+                                            pubkey, hash, blob.getSizeAsLong(), blob.getMimeType(), blob.getName(_uiState.value.fileMetadata), server
+                                        )
+                                        val mirrorEventObj = JSONObject(unsignedMirror)
+                                        val tagsArr = mirrorEventObj.getJSONArray("tags")
+                                        combinedLabels.forEach { tag -> tagsArr.put(JSONArray().put("t").put(tag)) }
+                                        
+                                        val signedMirror = signer.signEventBackground(signerPackage!!, mirrorEventObj.toString(), pubkey)
+                                        if (signedMirror != null) {
+                                            repository.mirrorBlob(server, blob.url, BlossomAuthHelper.encodeAuthHeader(signedMirror))
+                                        }
+                                    }
+                                }
+                                updatedMetadata[hash] = newNip94
                             }
                         }
                         
@@ -884,8 +944,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 val finalMeta = updatedMetadata.toMap()
                 val updatedBlobs = _uiState.value.allBlobs.map { b ->
                     if (b.sha256 in hashes) {
-                        val tags = finalMeta[b.sha256] ?: b.getTags()
-                        b.copy(nip94 = tags.map { listOf("t", it) })
+                        b.copy(nip94 = finalMeta[b.sha256] ?: b.nip94)
                     } else b
                 }
                 

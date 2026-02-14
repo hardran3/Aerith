@@ -112,20 +112,31 @@ object BlossomAuthHelper {
         sha256: String,
         url: String,
         mimeType: String?,
-        tags: List<String>
+        tags: List<String>,
+        name: String? = null,
+        alt: String? = null,
+        summary: String? = null,
+        fallbacks: List<String> = emptyList()
     ): String {
         val eventTags = JSONArray()
         eventTags.put(JSONArray().put("x").put(sha256))
         eventTags.put(JSONArray().put("url").put(url))
         if (mimeType != null) eventTags.put(JSONArray().put("m").put(mimeType))
+        if (name != null) eventTags.put(JSONArray().put("name").put(name))
+        if (alt != null) eventTags.put(JSONArray().put("alt").put(alt))
+        if (summary != null) eventTags.put(JSONArray().put("summary").put(summary))
         
         tags.forEach { tag ->
             eventTags.put(JSONArray().put("t").put(tag))
         }
 
+        fallbacks.forEach { fallbackUrl ->
+            eventTags.put(JSONArray().put("fallback").put(fallbackUrl))
+        }
+
         val event = JSONObject()
         event.put("kind", 1063)
-        event.put("content", "")
+        event.put("content", summary ?: "")
         event.put("pubkey", pubkey)
         event.put("created_at", System.currentTimeMillis() / 1000)
         event.put("tags", eventTags)

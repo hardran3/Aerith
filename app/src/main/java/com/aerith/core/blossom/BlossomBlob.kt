@@ -49,12 +49,14 @@ data class BlossomBlob(
     /**
      * Helper to get all 't' tags (labels) from NIP-94 tags or metadata.
      */
-    fun getTags(fileMetadata: Map<String, List<String>> = emptyMap()): List<String> {
+    fun getTags(fileMetadata: Map<String, List<List<String>>> = emptyMap()): List<String> {
         // Priority 1: Local/Relay metadata (manual labels)
         // Ensure case-insensitive hash lookup
         val normalizedHash = sha256.lowercase()
-        val localTags = fileMetadata[normalizedHash] ?: fileMetadata[sha256]
-        if (localTags != null) return localTags
+        val localNip94 = fileMetadata[normalizedHash] ?: fileMetadata[sha256]
+        if (localNip94 != null) {
+            return localNip94.filter { it.firstOrNull() == "t" }.mapNotNull { it.getOrNull(1) }.distinct()
+        }
 
         // Priority 2: Server-side nip94 tags
         val raw = nip94 ?: return emptyList()
@@ -76,6 +78,36 @@ data class BlossomBlob(
         }
 
         return emptyList()
+    }
+
+    /**
+     * Helper to get the filename from NIP-94 tags or metadata if available.
+     */
+    fun getName(fileMetadata: Map<String, List<List<String>>> = emptyMap()): String? {
+        // Priority 1: Local/Relay metadata
+        val normalizedHash = sha256.lowercase()
+        val localNip94 = fileMetadata[normalizedHash] ?: fileMetadata[sha256]
+        if (localNip94 != null) {
+            val nameTag = localNip94.find { it.firstOrNull() == "name" }
+            if (nameTag != null) return nameTag.getOrNull(1)
+        }
+
+        // Priority 2: Server-side nip94 tags
+        val raw = nip94 ?: return null
+        
+        // Handle List format: [["name", "filename.jpg"], ["x", "hash"]]
+        if (raw is List<*>) {
+            val list = raw.filterIsInstance<List<String>>()
+            val nameTag = list.find { it.firstOrNull() == "name" }
+            return nameTag?.getOrNull(1)
+        }
+        
+        // Handle Map format: {"name": "filename.jpg"}
+        if (raw is Map<*, *>) {
+            return (raw["name"] as? String)
+        }
+        
+        return null
     }
 
     /**

@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.ensureActive
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
@@ -138,65 +139,106 @@ class BlossomRepository(private val context: Context) {
         authHeaders: Map<String, String> = emptyMap()
     ): List<BlossomBlob> = withContext(Dispatchers.IO) {
         val normalizedHeaders = authHeaders.mapKeys { normalizeUrl(it.key) }
+        val limit = 256
         
         val deferredResults = servers.map { server ->
             async {
                 val cleanServer = server.removeSuffix("/")
                 val normalizedServer = normalizeUrl(server)
                 val isLocal = cleanServer.contains("127.0.0.1") || cleanServer.contains("localhost")
-                val url = "$cleanServer/list/$pubkey"
                 val authHeader = normalizedHeaders[normalizedServer] ?: normalizedHeaders[cleanServer]
                 
-                Log.d("BlossomRepo", "Fetching list from: $url")
-                
-                suspend fun tryFetch(headerValue: String?): List<BlossomBlob>? {
-                    var lastException: Exception? = null
-                    for (attempt in 1..2) { // Simple retry for transient errors
-                        val request = Request.Builder()
-                            .url(url)
-                            .apply {
-                                if (headerValue != null) header("Authorization", headerValue)
-                            }
-                            .header("User-Agent", "Aerith/1.0")
-                            .build()
+                val allBlobsForServer = mutableListOf<BlossomBlob>()
+                var cursor: String? = null
+                var hasMore = true
+                var pageCount = 0
+                val maxPages = 100 // Safety limit
 
-                        try {
-                            client.newCall(request).execute().use { response ->
-                                val code = response.code
-                                val bodyString = response.body?.string() ?: ""
-                                
-                                if (code == 200) {
-                                    val blobs = listAdapter.fromJson(bodyString) ?: emptyList()
-                                    Log.i("BlossomRepo", "SUCCESS from $cleanServer with prefix ${headerValue?.take(10)}")
-                                    return blobs.map { it.copy(serverUrl = server) }
-                                } else if (code == 401 && !isLocal) {
-                                    Log.w("BlossomRepo", "401 from $cleanServer with ${headerValue?.take(10)}")
-                                    return null // Try next prefix
-                                } else {
-                                    Log.w("BlossomRepo", "List failed for $cleanServer: HTTP $code - ${bodyString.take(100)}")
-                                    return emptyList<BlossomBlob>()
-                                }
-                            }
-                        } catch (e: Exception) {
-                            lastException = e
-                            Log.w("BlossomRepo", "Attempt $attempt failed for $server: ${e.message}")
-                            if (attempt < 2) kotlinx.coroutines.delay(500)
+                while (hasMore && pageCount < maxPages) {
+                    coroutineContext.ensureActive()
+                    pageCount++
+                    
+                    val url = cleanServer.toHttpUrlOrNull()?.newBuilder()
+                        ?.addPathSegment("list")
+                        ?.addPathSegment(pubkey)
+                        ?.addQueryParameter("limit", limit.toString())
+                        ?.apply {
+                            if (cursor != null) addQueryParameter("cursor", cursor)
                         }
+                        ?.build() ?: break
+
+                    Log.d("BlossomRepo", "Fetching list page $pageCount from: $url")
+                    
+                        suspend fun tryFetch(headerValue: String?): List<BlossomBlob>? {
+                        var lastException: Exception? = null
+                        for (attempt in 1..2) {
+                            coroutineContext.ensureActive()
+                            val request = Request.Builder()
+                                .url(url)
+                                .apply {
+                                    if (headerValue != null) header("Authorization", headerValue)
+                                }
+                                .header("User-Agent", "Aerith/1.0")
+                                .build()
+
+                            try {
+                                client.newCall(request).execute().use { response ->
+                                    val code = response.code
+                                    val bodyString = response.body?.string() ?: ""
+                                    
+                                    if (code == 200) {
+                                        val blobs = listAdapter.fromJson(bodyString) ?: emptyList()
+                                        Log.i("BlossomRepo", "SUCCESS page from $cleanServer (${blobs.size} items)")
+                                        return blobs.map { it.copy(serverUrl = server) }
+                                    } else if (code == 401 && !isLocal) {
+                                        return null // Try next prefix
+                                    } else {
+                                        Log.w("BlossomRepo", "List failed for $cleanServer: HTTP $code")
+                                        return emptyList<BlossomBlob>()
+                                    }
+                                }
+                            } catch (e: Exception) {
+                                lastException = e
+                                if (attempt < 2) kotlinx.coroutines.delay(500)
+                            }
+                        }
+                        return emptyList()
                     }
-                    Log.e("BlossomRepo", "All attempts failed for $server", lastException)
-                    return emptyList<BlossomBlob>()
+
+                    var pageResult = tryFetch(authHeader)
+                    
+                    if (pageResult == null && authHeader != null && authHeader.startsWith("Nostr ") && !isLocal) {
+                        val blossomHeader = authHeader.replaceFirst("Nostr ", "Blossom ")
+                        pageResult = tryFetch(blossomHeader)
+                    }
+
+                    val blobs = pageResult ?: emptyList()
+                    if (blobs.isEmpty()) {
+                        hasMore = false
+                        continue
+                    }
+
+                    allBlobsForServer.addAll(blobs)
+                    Log.d("BlossomRepo", "Collected ${blobs.size} items from $cleanServer. Running total: ${allBlobsForServer.size}")
+
+                    // Check if the page is full and the cursor is moving
+                    if (blobs.size >= 250) {
+                        val nextCursor = blobs.last().sha256
+                        if (nextCursor == cursor) {
+                            Log.w("BlossomRepo", "Server returned identical page for $cleanServer (cursor didn't move). Stopping.")
+                            hasMore = false
+                        } else {
+                            cursor = nextCursor
+                            Log.d("BlossomRepo", "Requesting next page with cursor: ${cursor.take(8)}...")
+                        }
+                    } else {
+                        Log.d("BlossomRepo", "Page is partial (${blobs.size} < 250), finishing fetch for $cleanServer")
+                        hasMore = false
+                    }
                 }
 
-                // Strategy: Try original (Nostr), then try swapping prefix to Blossom
-                var result = tryFetch(authHeader)
-                
-                if (result == null && authHeader != null && authHeader.startsWith("Nostr ") && !isLocal) {
-                    val blossomHeader = authHeader.replaceFirst("Nostr ", "Blossom ")
-                    Log.d("BlossomRepo", "Retrying $cleanServer with 'Blossom' prefix...")
-                    result = tryFetch(blossomHeader)
-                }
-
-                result ?: emptyList()
+                Log.i("BlossomRepo", "FINISHED fetching from $cleanServer. Total: ${allBlobsForServer.size} blobs in $pageCount pages")
+                allBlobsForServer
             }
         }
         val allBlobs = deferredResults.awaitAll().flatten()

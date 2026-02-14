@@ -122,6 +122,7 @@ fun MediaViewerScreen(
     var blobToDelete by remember { mutableStateOf<com.aerith.core.blossom.BlossomBlob?>(null) }
     var pendingMirrorServer by remember { mutableStateOf<String?>(null) }
     var pendingLabelUpdateTags by remember { mutableStateOf<List<String>?>(null) }
+    var pendingNameUpdate by remember { mutableStateOf<String?>(null) }
     
     val signLauncher = rememberLauncherForActivityResult(
         contract = ActivityResultContracts.StartActivityForResult()
@@ -138,7 +139,24 @@ fun MediaViewerScreen(
                 } else if (pendingLabelUpdateTags != null && currentBlob != null) {
                     val pk = authState.pubkey ?: return@rememberLauncherForActivityResult
                     galleryViewModel.updateLabels(pk, authState.relays, currentBlob, pendingLabelUpdateTags!!, signedJson, signer, authState.signerPackage)
+                    
+                    val existingNip94 = (currentBlob.nip94 as? List<*>)?.filterIsInstance<List<String>>() ?: emptyList()
+                    val otherTags = existingNip94.filter { it.firstOrNull() != "t" }
+                    val newNip94 = otherTags + pendingLabelUpdateTags!!.map { listOf("t", it) }
+                    authViewModel.updateMetadata(currentBlob.sha256, newNip94)
+                    
                     pendingLabelUpdateTags = null
+                } else if (pendingNameUpdate != null && currentBlob != null) {
+                    val pk = authState.pubkey ?: return@rememberLauncherForActivityResult
+                    val currentTags = currentBlob.getTags(uiState.fileMetadata)
+                    galleryViewModel.updateLabels(pk, authState.relays, currentBlob, currentTags, signedJson, signer, authState.signerPackage, newName = pendingNameUpdate)
+                    
+                    val existingNip94 = (currentBlob.nip94 as? List<*>)?.filterIsInstance<List<String>>() ?: emptyList()
+                    val otherTags = existingNip94.filter { it.firstOrNull() != "name" }
+                    val newNip94 = otherTags + listOf(listOf("name", pendingNameUpdate!!))
+                    authViewModel.updateMetadata(currentBlob.sha256, newNip94)
+                    
+                    pendingNameUpdate = null
                 }
             }
         }
@@ -338,6 +356,60 @@ fun MediaViewerScreen(
                 Column(modifier = Modifier.padding(16.dp)) {
                     Text("File Details", style = MaterialTheme.typography.headlineSmall)
                     Spacer(modifier = Modifier.height(16.dp))
+
+                    // --- Filename Section ---
+                    var fileNameInput by remember { mutableStateOf(currentBlob.getName(uiState.fileMetadata) ?: "") }
+                    var isEditingName by remember { mutableStateOf(false) }
+
+                    Text("Filename", style = MaterialTheme.typography.titleMedium)
+                    if (isEditingName) {
+                        OutlinedTextField(
+                            value = fileNameInput,
+                            onValueChange = { fileNameInput = it },
+                            modifier = Modifier.fillMaxWidth(),
+                            trailingIcon = {
+                                IconButton(onClick = {
+                                    if (pk != null) {
+                                        val currentTags = currentBlob.getTags(uiState.fileMetadata)
+                                        val unsigned = BlossomAuthHelper.createFileMetadataEvent(
+                                            pk, currentBlob.sha256, url, currentBlob.getMimeType(), currentTags,
+                                            name = fileNameInput.trim()
+                                        )
+                                        val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
+                                        if (signed != null) {
+                                            galleryViewModel.updateLabels(pk, authState.relays, currentBlob, currentTags, signed, signer, pkg, newName = fileNameInput.trim())
+                                            
+                                            val existingNip94 = (currentBlob.nip94 as? List<*>)?.filterIsInstance<List<String>>() ?: emptyList()
+                                            val otherTags = existingNip94.filter { it.firstOrNull() != "name" }
+                                            val newNip94 = otherTags + listOf(listOf("name", fileNameInput.trim()))
+                                            authViewModel.updateMetadata(currentBlob.sha256, newNip94)
+                                        } else {
+                                            pendingNameUpdate = fileNameInput.trim()
+                                            signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
+                                        }
+                                    }
+                                    isEditingName = false
+                                }) {
+                                    Icon(Icons.Default.Save, "Save Name")
+                                }
+                            }
+                        )
+                    } else {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.clickable { isEditingName = true }.padding(vertical = 4.dp)
+                        ) {
+                            Text(
+                                text = fileNameInput.ifEmpty { "Add filename..." },
+                                color = if (fileNameInput.isEmpty()) MaterialTheme.colorScheme.secondary else MaterialTheme.colorScheme.onSurface,
+                                style = MaterialTheme.typography.bodyLarge,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Icon(Icons.Default.Edit, null, modifier = Modifier.size(16.dp), tint = MaterialTheme.colorScheme.secondary)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
                     
                     // --- Labels Section ---
                     Text("Labels", style = MaterialTheme.typography.titleMedium)
@@ -360,7 +432,12 @@ fun MediaViewerScreen(
                                         val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
                                         if (signed != null) {
                                             galleryViewModel.updateLabels(pk, authState.relays, currentBlob, updatedTags, signed, signer, pkg)
-                                            authViewModel.updateMetadata(currentBlob.sha256, updatedTags)
+                                            
+                                            // Sync to AuthViewModel with full NIP-94 tags
+                                            val existingNip94 = (currentBlob.nip94 as? List<*>)?.filterIsInstance<List<String>>() ?: emptyList()
+                                            val otherTags = existingNip94.filter { it.firstOrNull() != "t" }
+                                            val newNip94 = otherTags + updatedTags.map { listOf("t", it) }
+                                            authViewModel.updateMetadata(currentBlob.sha256, newNip94)
                                         } else {
                                             pendingLabelUpdateTags = updatedTags
                                             signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
@@ -394,7 +471,11 @@ fun MediaViewerScreen(
                                         
                                         if (signed != null) {
                                             galleryViewModel.updateLabels(pk, authState.relays, currentBlob, updatedTags, signed, signer, pkg)
-                                            authViewModel.updateMetadata(currentBlob.sha256, updatedTags)
+                                            
+                                            val existingNip94 = (currentBlob.nip94 as? List<*>)?.filterIsInstance<List<String>>() ?: emptyList()
+                                            val otherTags = existingNip94.filter { it.firstOrNull() != "t" }
+                                            val newNip94 = otherTags + updatedTags.map { listOf("t", it) }
+                                            authViewModel.updateMetadata(currentBlob.sha256, newNip94)
                                             newTag = ""
                                         } else {
                                             pendingLabelUpdateTags = updatedTags
@@ -431,7 +512,11 @@ fun MediaViewerScreen(
                                             val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
                                             if (signed != null) {
                                                 galleryViewModel.updateLabels(pk, authState.relays, currentBlob, updatedTags, signed, signer, pkg)
-                                                authViewModel.updateMetadata(currentBlob.sha256, updatedTags)
+                                                
+                                                val existingNip94 = (currentBlob.nip94 as? List<*>)?.filterIsInstance<List<String>>() ?: emptyList()
+                                                val otherTags = existingNip94.filter { it.firstOrNull() != "t" }
+                                                val newNip94 = otherTags + updatedTags.map { listOf("t", it) }
+                                                authViewModel.updateMetadata(currentBlob.sha256, newNip94)
                                             } else {
                                                 pendingLabelUpdateTags = updatedTags
                                                 signLauncher.launch(signer.getSignEventIntent(unsigned, pk))

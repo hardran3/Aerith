@@ -63,7 +63,8 @@ fun GalleryScreen(
     
     // Bulk Label Dialog State
     var showBulkLabelDialog by remember { mutableStateOf(false) }
-    var showBulkDeleteDialog by remember { mutableStateOf(false) }
+    var showBulkDeleteServerDialog by remember { mutableStateOf(false) }
+    var showBulkMirrorDialog by remember { mutableStateOf(false) }
     var showFilterSheet by remember { mutableStateOf(false) }
     val filterSheetState = rememberModalBottomSheetState()
     var bulkTagsInput by remember { mutableStateOf("") }
@@ -96,10 +97,10 @@ fun GalleryScreen(
                     mimeType = currentUpload.mimeType,
                     signedEventJson = signedJson,
                     expectedHash = currentUpload.hash,
-                    allServers = authState.blossomServers,
                     signer = signer,
                     signerPackage = authState.signerPackage,
-                    pubkey = pubkey
+                    pubkey = pubkey,
+                    relays = authState.relays
                 )
                 isSigningFlowActive = false
                 return@rememberLauncherForActivityResult
@@ -192,20 +193,20 @@ fun GalleryScreen(
         contract = ActivityResultContracts.PickMultipleVisualMedia()
     ) { uris: List<Uri> ->
         if (uris.isNotEmpty()) {
-            uploadViewModel.startBulkUpload(uris, context.contentResolver)
+            uploadViewModel.startBulkUpload(uris, context.contentResolver, authState.blossomServers)
         }
     }
 
     // --- Sequential Upload Queue Manager ---
-    LaunchedEffect(uploadState.uploadQueue, uploadState.currentUpload, uploadState.targetServer, uploadState.isUploading) {
+    LaunchedEffect(uploadState.uploadQueue, uploadState.currentUpload, uploadState.targetServer, uploadState.isUploading, uploadState.showReviewDialog) {
         val pubkey = authState.pubkey
         val pkg = authState.signerPackage
-        val servers = authState.blossomServers
+        val relays = authState.relays
         
-        if (pubkey != null && servers.isNotEmpty() && !isSigningFlowActive && !uploadState.isUploading) {
+        if (pubkey != null && !isSigningFlowActive && !uploadState.isUploading && !uploadState.showReviewDialog) {
             // If we have a queue but nothing is being processed, pick the next one
             if (uploadState.uploadQueue.isNotEmpty() && uploadState.currentUpload == null) {
-                uploadViewModel.processNextInQueue(servers)
+                uploadViewModel.processNextInQueue()
                 return@LaunchedEffect
             }
             
@@ -216,7 +217,7 @@ fun GalleryScreen(
                 val unsignedEvent = BlossomAuthHelper.createUploadAuthEvent(
                     pubkey = pubkey, sha256 = current.hash, size = current.size,
                     mimeType = current.mimeType,
-                    fileName = current.uri.lastPathSegment,
+                    fileName = "${current.displayName}.${current.extension}",
                     serverUrl = target
                 )
                 
@@ -231,10 +232,10 @@ fun GalleryScreen(
                         mimeType = current.mimeType,
                         signedEventJson = signed,
                         expectedHash = current.hash,
-                        allServers = servers,
                         signer = signer,
                         signerPackage = pkg,
-                        pubkey = pubkey
+                        pubkey = pubkey,
+                        relays = relays
                     )
                 } else {
                     isSigningFlowActive = true
@@ -243,6 +244,116 @@ fun GalleryScreen(
                 }
             }
         }
+    }
+
+    if (uploadState.showReviewDialog) {
+        var batchTags by remember { mutableStateOf("") }
+        val selectedServers = remember { mutableStateListOf<String>().apply { addAll(uploadState.selectedServers) } }
+        val allExistingTags = galleryViewModel.getAllUniqueTags()
+
+        AlertDialog(
+            onDismissRequest = { uploadViewModel.dismissReview() },
+            title = { Text("Upload Review (${uploadState.uploadQueue.size} items)") },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth().heightIn(max = 500.dp).verticalScroll(rememberScrollState())) {
+                    Text("Batch Tags", style = MaterialTheme.typography.titleMedium)
+                    OutlinedTextField(
+                        value = batchTags,
+                        onValueChange = { batchTags = it },
+                        placeholder = { Text("nature, vacation...") },
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                    
+                    if (allExistingTags.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Suggestions:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.secondary)
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            allExistingTags.take(12).forEach { tag ->
+                                val currentTags = batchTags.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                                val isSelected = tag in currentTags
+                                FilterChip(
+                                    selected = isSelected,
+                                    onClick = {
+                                        val nextTags = if (isSelected) {
+                                            currentTags.filter { it != tag }
+                                        } else {
+                                            (currentTags + tag).distinct()
+                                        }
+                                        batchTags = nextTags.joinToString(", ")
+                                    },
+                                    label = { Text(tag) }
+                                )
+                            }
+                        }
+                    }
+                    
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("Target Servers", style = MaterialTheme.typography.titleMedium)
+                    authState.blossomServers.forEach { server ->
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Checkbox(
+                                checked = selectedServers.contains(server),
+                                onCheckedChange = { checked ->
+                                    if (checked) selectedServers.add(server) else selectedServers.remove(server)
+                                }
+                            )
+                            Text(server.removePrefix("https://").removeSuffix("/"))
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Text("File Details", style = MaterialTheme.typography.titleMedium)
+                    uploadState.uploadQueue.forEach { pending ->
+                        Row(
+                            modifier = Modifier.padding(vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            AsyncImage(
+                                model = pending.uri,
+                                contentDescription = null,
+                                modifier = Modifier.size(60.dp).clip(MaterialTheme.shapes.small),
+                                contentScale = ContentScale.Crop
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Column {
+                                OutlinedTextField(
+                                    value = pending.displayName,
+                                    onValueChange = { uploadViewModel.updatePendingUpload(pending.hash, it) },
+                                    label = { Text("Filename") },
+                                    suffix = { Text(".${pending.extension}") },
+                                    modifier = Modifier.fillMaxWidth()
+                                )
+                                Text(
+                                    text = "${pending.size / 1024} KB",
+                                    style = MaterialTheme.typography.labelSmall,
+                                    color = MaterialTheme.colorScheme.secondary
+                                )
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = {
+                        val tags = batchTags.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                        uploadViewModel.setBatchOptions(selectedServers.toList(), tags)
+                        uploadViewModel.confirmUpload()
+                    },
+                    enabled = selectedServers.isNotEmpty()
+                ) {
+                    Text("Upload All")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { uploadViewModel.dismissReview() }) {
+                    Text("Cancel")
+                }
+            }
+        )
     }
     
     LaunchedEffect(authState.pubkey, authState.blossomServers, authState.isLoading) {
@@ -254,6 +365,7 @@ fun GalleryScreen(
 
     LaunchedEffect(uploadState.successMessage) {
         if (uploadState.successMessage != null) {
+            authViewModel.refreshMetadata()
             triggerAuthenticatedList()
             android.widget.Toast.makeText(context, uploadState.successMessage, android.widget.Toast.LENGTH_SHORT).show()
             uploadViewModel.clearState()
@@ -335,27 +447,102 @@ fun GalleryScreen(
         )
     }
 
-    if (showBulkDeleteDialog) {
+    if (showBulkDeleteServerDialog) {
+        val selectedServers = remember { mutableStateListOf<String>().apply { addAll(authState.blossomServers) } }
+
         AlertDialog(
-            onDismissRequest = { showBulkDeleteDialog = false },
-            title = { Text("Delete ${state.selectedHashes.size} items?") },
-            text = { Text("These items will be removed from all Blossom servers. A copy will remain in your local Trash.") },
+            onDismissRequest = { showBulkDeleteServerDialog = false },
+            title = { Text("Delete ${state.selectedHashes.size} items") },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
+                    Text("Select servers to delete from. If an item is removed from ALL servers, a copy will be moved to your local Trash.")
+                    Spacer(modifier = Modifier.height(16.dp))
+                    
+                    authState.blossomServers.forEach { server ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                if (selectedServers.contains(server)) selectedServers.remove(server) else selectedServers.add(server)
+                            }
+                        ) {
+                            Checkbox(
+                                checked = selectedServers.contains(server),
+                                onCheckedChange = { checked ->
+                                    if (checked) selectedServers.add(server) else selectedServers.remove(server)
+                                }
+                            )
+                            Text(server.removePrefix("https://").removeSuffix("/"))
+                        }
+                    }
+                }
+            },
             confirmButton = {
                 TextButton(
                     onClick = {
                         val pk = authState.pubkey
                         if (pk != null) {
-                            galleryViewModel.bulkDelete(pk, state.selectedHashes, signer, authState.signerPackage)
+                            galleryViewModel.bulkDelete(pk, state.selectedHashes, selectedServers.toList(), signer, authState.signerPackage)
                         }
-                        showBulkDeleteDialog = false
+                        showBulkDeleteServerDialog = false
                     },
+                    enabled = selectedServers.isNotEmpty(),
                     colors = ButtonDefaults.textButtonColors(contentColor = MaterialTheme.colorScheme.error)
                 ) {
                     Text("Delete")
                 }
             },
             dismissButton = {
-                TextButton(onClick = { showBulkDeleteDialog = false }) {
+                TextButton(onClick = { showBulkDeleteServerDialog = false }) {
+                    Text("Cancel")
+                }
+            }
+        )
+    }
+
+    if (showBulkMirrorDialog) {
+        val selectedServers = remember { mutableStateListOf<String>().apply { addAll(authState.blossomServers) } }
+        
+        AlertDialog(
+            onDismissRequest = { showBulkMirrorDialog = false },
+            title = { Text("Mirror ${state.selectedHashes.size} items") },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth().heightIn(max = 300.dp).verticalScroll(rememberScrollState())) {
+                    Text("Select target servers:")
+                    Spacer(modifier = Modifier.height(8.dp))
+                    authState.blossomServers.forEach { server ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier.fillMaxWidth().clickable {
+                                if (selectedServers.contains(server)) selectedServers.remove(server) else selectedServers.add(server)
+                            }
+                        ) {
+                            Checkbox(
+                                checked = selectedServers.contains(server),
+                                onCheckedChange = { checked ->
+                                    if (checked) selectedServers.add(server) else selectedServers.remove(server)
+                                }
+                            )
+                            Text(server.removePrefix("https://").removeSuffix("/"))
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val pk = authState.pubkey
+                        if (pk != null) {
+                            galleryViewModel.bulkMirrorToAll(pk, state.selectedHashes, selectedServers.toList(), signer, authState.signerPackage, authState.localBlossomUrl)
+                        }
+                        showBulkMirrorDialog = false
+                    },
+                    enabled = selectedServers.isNotEmpty()
+                ) {
+                    Text("Mirror")
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showBulkMirrorDialog = false }) {
                     Text("Cancel")
                 }
             }
@@ -414,16 +601,11 @@ fun GalleryScreen(
                         IconButton(onClick = { showBulkLabelDialog = true }) {
                             Icon(Icons.Default.Label, "Bulk Label")
                         }
-                        IconButton(onClick = {
-                            val pk = authState.pubkey
-                            if (pk != null) {
-                                galleryViewModel.bulkMirrorToAll(pk, state.selectedHashes, authState.blossomServers, signer, authState.signerPackage, authState.localBlossomUrl)
-                            }
-                        }) {
+                        IconButton(onClick = { showBulkMirrorDialog = true }) {
                             Icon(Icons.Default.CloudSync, "Mirror to All")
                         }
-                        IconButton(onClick = { showBulkDeleteDialog = true }) {
-                            Icon(Icons.Default.Delete, "Delete from all servers", tint = MaterialTheme.colorScheme.error)
+                        IconButton(onClick = { showBulkDeleteServerDialog = true }) {
+                            Icon(Icons.Default.Delete, "Delete from selected servers", tint = MaterialTheme.colorScheme.error)
                         }
                     }
                 )

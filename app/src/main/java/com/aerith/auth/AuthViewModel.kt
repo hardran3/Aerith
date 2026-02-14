@@ -26,7 +26,7 @@ data class AuthState(
     val profileName: String? = null,
     val signerPackage: String? = null,
     val localBlossomUrl: String? = null,
-    val fileMetadata: Map<String, List<String>> = emptyMap(), // hash -> tags
+    val fileMetadata: Map<String, List<List<String>>> = emptyMap(), // hash -> List of tags [["t", "tag"], ["name", "file"]]
     val isLoading: Boolean = false,
     val error: String? = null
 )
@@ -48,17 +48,37 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
             val metadata = if (cachedMetadataJson != null) {
                 try {
                     val json = org.json.JSONObject(cachedMetadataJson)
-                    val map = mutableMapOf<String, List<String>>()
+                    val map = mutableMapOf<String, List<List<String>>>()
                     json.keys().forEach { hash ->
                         val tagsArray = json.getJSONArray(hash)
-                        val tags = mutableListOf<String>()
+                        val tagsList = mutableListOf<List<String>>()
                         for (i in 0 until tagsArray.length()) {
-                            tags.add(tagsArray.getString(i))
+                            val tag = tagsArray.getJSONArray(i)
+                            val tagFields = mutableListOf<String>()
+                            for (j in 0 until tag.length()) {
+                                tagFields.add(tag.getString(j))
+                            }
+                            tagsList.add(tagFields)
                         }
-                        map[hash] = tags
+                        map[hash] = tagsList
                     }
                     map
-                } catch (e: Exception) { emptyMap() }
+                } catch (e: Exception) {
+                    // Fallback for old cache format (hash -> List<String>)
+                    try {
+                        val json = org.json.JSONObject(cachedMetadataJson)
+                        val map = mutableMapOf<String, List<List<String>>>()
+                        json.keys().forEach { hash ->
+                            val tagsArray = json.getJSONArray(hash)
+                            val tagsList = mutableListOf<List<String>>()
+                            for (i in 0 until tagsArray.length()) {
+                                tagsList.add(listOf("t", tagsArray.getString(i)))
+                            }
+                            map[hash] = tagsList
+                        }
+                        map
+                    } catch (e2: Exception) { emptyMap() }
+                }
             } else emptyMap()
 
             _uiState.value = AuthState(
@@ -333,7 +353,7 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
             }
             
             val allEvents = deferred.awaitAll().flatten()
-            val metadataMap = mutableMapOf<String, List<String>>()
+            val metadataMap = mutableMapOf<String, List<List<String>>>()
             
             // Group by hash 'x' and take latest event per hash
             allEvents.groupBy { event ->
@@ -341,8 +361,11 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
             }.forEach { (hash, events) ->
                 if (hash != null) {
                     val latest = events.maxByOrNull { it.createdAt }
-                    val tags = latest?.tags?.filter { it.firstOrNull() == "t" }?.mapNotNull { it.getOrNull(1) } ?: emptyList()
-                    metadataMap[hash] = tags.distinct()
+                    // Keep all NIP-94 relevant tags
+                    val relevantTags = latest?.tags?.filter { tag ->
+                        tag.firstOrNull() in listOf("t", "name", "alt", "summary", "thumb", "blurhash", "dim")
+                    } ?: emptyList()
+                    metadataMap[hash] = relevantTags
                 }
             }
 
@@ -357,19 +380,27 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                     _uiState.value = _uiState.value.copy(fileMetadata = currentMetadata)
                     
                     // Save to cache
-                    try {
-                        val json = org.json.JSONObject()
-                        currentMetadata.forEach { (h, t) ->
-                            val arr = org.json.JSONArray()
-                            t.forEach { arr.put(it) }
-                            json.put(h, arr)
-                        }
-                        settingsRepository.saveFileMetadataCache(json.toString())
-                    } catch (e: Exception) {
-                        Log.e("AuthViewModel", "Failed to save metadata cache", e)
-                    }
+                    saveMetadataToCache(currentMetadata)
                 }
             }
+        }
+    }
+
+    private fun saveMetadataToCache(metadata: Map<String, List<List<String>>>) {
+        try {
+            val json = org.json.JSONObject()
+            metadata.forEach { (h, tagsList) ->
+                val tagsArray = org.json.JSONArray()
+                tagsList.forEach { tag ->
+                    val tagArray = org.json.JSONArray()
+                    tag.forEach { tagArray.put(it) }
+                    tagsArray.put(tagArray)
+                }
+                json.put(h, tagsArray)
+            }
+            settingsRepository.saveFileMetadataCache(json.toString())
+        } catch (e: Exception) {
+            Log.e("AuthViewModel", "Failed to save metadata cache", e)
         }
     }
 
@@ -378,22 +409,36 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.value = AuthState()
     }
 
-    fun updateMetadata(hash: String, tags: List<String>) {
+    fun updateMetadata(hash: String, tags: List<List<String>>) {
         val current = _uiState.value.fileMetadata.toMutableMap()
         current[hash.lowercase()] = tags
         _uiState.value = _uiState.value.copy(fileMetadata = current)
         
         // Persist immediately
-        try {
-            val json = org.json.JSONObject()
-            current.forEach { (h, t) ->
-                val arr = org.json.JSONArray()
-                t.forEach { arr.put(it) }
-                json.put(h, arr)
-            }
-            settingsRepository.saveFileMetadataCache(json.toString())
-        } catch (e: Exception) {
-            Log.e("AuthViewModel", "Failed to save metadata cache", e)
+        saveMetadataToCache(current)
+    }
+
+    fun refreshMetadata() {
+        val cachedMetadataJson = settingsRepository.getFileMetadataCache()
+        if (cachedMetadataJson != null) {
+            try {
+                val json = org.json.JSONObject(cachedMetadataJson)
+                val map = mutableMapOf<String, List<List<String>>>()
+                json.keys().forEach { hash ->
+                    val tagsArray = json.getJSONArray(hash)
+                    val tagsList = mutableListOf<List<String>>()
+                    for (i in 0 until tagsArray.length()) {
+                        val tag = tagsArray.getJSONArray(i)
+                        val tagFields = mutableListOf<String>()
+                        for (j in 0 until tag.length()) {
+                            tagFields.add(tag.getString(j))
+                        }
+                        tagsList.add(tagFields)
+                    }
+                    map[hash] = tagsList
+                }
+                _uiState.value = _uiState.value.copy(fileMetadata = map)
+            } catch (e: Exception) {}
         }
     }
 }
