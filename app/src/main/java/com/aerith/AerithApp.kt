@@ -42,7 +42,12 @@ class AerithApp : Application(), ImageLoaderFactory {
             .fetcherDispatcher(Dispatchers.IO)
             .decoderDispatcher(Dispatchers.Default)
             .components {
-                add(VideoFrameDecoder.Factory())
+                if (android.os.Build.VERSION.SDK_INT >= 28) {
+                    add(coil.decode.ImageDecoderDecoder.Factory())
+                } else {
+                    add(coil.decode.GifDecoder.Factory())
+                }
+                add(coil.decode.VideoFrameDecoder.Factory())
             }
             .crossfade(true)
             .build()

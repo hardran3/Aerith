@@ -77,6 +77,7 @@ fun AerithAppContent(
         composable(com.aerith.ui.navigation.Screen.Gallery.route) {
             GalleryScreen(
                 authState = authState,
+                authViewModel = authViewModel,
                 onMediaClick = { url ->
                     navController.navigate(com.aerith.ui.navigation.Screen.MediaViewer.createRoute(url))
                 },
@@ -94,7 +95,8 @@ fun AerithAppContent(
                 onLogout = {
                     authViewModel.logout()
                     galleryViewModel.clear()
-                }
+                },
+                galleryViewModel = galleryViewModel
             )
         }
 
@@ -107,6 +109,7 @@ fun AerithAppContent(
             MediaViewerScreen(
                 url = url,
                 authState = authState,
+                authViewModel = authViewModel,
                 galleryViewModel = galleryViewModel
             )
         }

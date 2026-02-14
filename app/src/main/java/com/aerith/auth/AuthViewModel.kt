@@ -25,6 +25,7 @@ data class AuthState(
     val profileUrl: String? = null,
     val profileName: String? = null,
     val signerPackage: String? = null,
+    val localBlossomUrl: String? = null,
     val fileMetadata: Map<String, List<String>> = emptyMap(), // hash -> tags
     val isLoading: Boolean = false,
     val error: String? = null
@@ -33,6 +34,7 @@ data class AuthState(
 class AuthViewModel(application: Application) : AndroidViewModel(application) {
 
     private val settingsRepository = com.aerith.core.data.SettingsRepository(application)
+    private val blossomRepository = com.aerith.core.blossom.BlossomRepository(application)
     private val _uiState = MutableStateFlow(AuthState())
     val uiState: StateFlow<AuthState> = _uiState.asStateFlow()
 
@@ -71,6 +73,14 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
             )
             // Still refresh data in background
             fetchRelayList(cachedPubkey)
+            checkLocalBlossom()
+        }
+    }
+
+    private fun checkLocalBlossom() {
+        viewModelScope.launch {
+            val localUrl = blossomRepository.detectLocalBlossom()
+            _uiState.value = _uiState.value.copy(localBlossomUrl = localUrl)
         }
     }
 
@@ -366,6 +376,25 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
     fun logout() {
         settingsRepository.clear()
         _uiState.value = AuthState()
+    }
+
+    fun updateMetadata(hash: String, tags: List<String>) {
+        val current = _uiState.value.fileMetadata.toMutableMap()
+        current[hash.lowercase()] = tags
+        _uiState.value = _uiState.value.copy(fileMetadata = current)
+        
+        // Persist immediately
+        try {
+            val json = org.json.JSONObject()
+            current.forEach { (h, t) ->
+                val arr = org.json.JSONArray()
+                t.forEach { arr.put(it) }
+                json.put(h, arr)
+            }
+            settingsRepository.saveFileMetadataCache(json.toString())
+        } catch (e: Exception) {
+            Log.e("AuthViewModel", "Failed to save metadata cache", e)
+        }
     }
 }
 

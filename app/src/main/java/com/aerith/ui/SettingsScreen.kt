@@ -4,11 +4,12 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -19,8 +20,11 @@ import com.aerith.auth.AuthState
 fun SettingsScreen(
     authState: AuthState,
     onBack: () -> Unit,
-    onLogout: () -> Unit
+    onLogout: () -> Unit,
+    galleryViewModel: com.aerith.ui.gallery.GalleryViewModel = androidx.lifecycle.viewmodel.compose.viewModel()
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val settingsRepository = remember { com.aerith.core.data.SettingsRepository(context) }
     var selectedTab by remember { mutableIntStateOf(0) }
     val tabs = listOf("General", "Nostr", "Blossom")
 
@@ -57,7 +61,7 @@ fun SettingsScreen(
 
             // Tab Content
             when (selectedTab) {
-                0 -> GeneralTab(onLogout)
+                0 -> GeneralTab(onLogout, settingsRepository, galleryViewModel)
                 1 -> NostrTab(authState)
                 2 -> BlossomTab(authState)
             }
@@ -66,13 +70,63 @@ fun SettingsScreen(
 }
 
 @Composable
-private fun GeneralTab(onLogout: () -> Unit) {
+private fun GeneralTab(
+    onLogout: () -> Unit,
+    settingsRepository: com.aerith.core.data.SettingsRepository,
+    galleryViewModel: com.aerith.ui.gallery.GalleryViewModel
+) {
     Column(
         modifier = Modifier
             .fillMaxSize()
             .padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(16.dp)
     ) {
+        // Display Section
+        Text(
+            text = "Display",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.primary
+        )
+
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column {
+                var serverBadgeEnabled by remember { mutableStateOf(settingsRepository.isServerBadgeEnabled()) }
+                var fileTypeBadgeEnabled by remember { mutableStateOf(settingsRepository.isFileTypeBadgeEnabled()) }
+
+                ListItem(
+                    headlineContent = { Text("Server Count Badge") },
+                    supportingContent = { Text("Show how many servers host this file") },
+                    trailingContent = {
+                        Switch(
+                            checked = serverBadgeEnabled,
+                            onCheckedChange = {
+                                serverBadgeEnabled = it
+                                settingsRepository.setServerBadgeEnabled(it)
+                                galleryViewModel.refreshDisplaySettings()
+                            }
+                        )
+                    }
+                )
+                
+                ListItem(
+                    headlineContent = { Text("File Type Badge") },
+                    supportingContent = { Text("Show extension (JPG, MP4, etc)") },
+                    trailingContent = {
+                        Switch(
+                            checked = fileTypeBadgeEnabled,
+                            onCheckedChange = {
+                                fileTypeBadgeEnabled = it
+                                settingsRepository.setFileTypeBadgeEnabled(it)
+                                galleryViewModel.refreshDisplaySettings()
+                            }
+                        )
+                    }
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.height(8.dp))
+
         Text(
             text = "Session",
             style = MaterialTheme.typography.titleMedium,
@@ -192,6 +246,38 @@ private fun BlossomTab(authState: AuthState) {
         verticalArrangement = Arrangement.spacedBy(12.dp)
     ) {
         item {
+            Text(
+                text = "Local Storage",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+        }
+
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                ListItem(
+                    headlineContent = { Text("Local Blossom Cache") },
+                    supportingContent = { 
+                        Text(if (authState.localBlossomUrl != null) "Active on port 24242" else "Service not detected") 
+                    },
+                    leadingContent = {
+                        Icon(
+                            imageVector = if (authState.localBlossomUrl != null) Icons.Default.Dns else Icons.Default.CloudOff,
+                            contentDescription = null,
+                            tint = if (authState.localBlossomUrl != null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.outline
+                        )
+                    },
+                    trailingContent = {
+                        if (authState.localBlossomUrl != null) {
+                            Icon(Icons.Default.CheckCircle, null, tint = Color.Green)
+                        }
+                    }
+                )
+            }
+        }
+
+        item {
+            Spacer(modifier = Modifier.height(8.dp))
             Text(
                 text = "Blossom Servers (${authState.blossomServers.size})",
                 style = MaterialTheme.typography.titleMedium,

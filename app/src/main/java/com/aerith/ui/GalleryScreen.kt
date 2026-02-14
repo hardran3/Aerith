@@ -15,7 +15,9 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -28,6 +30,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.viewmodel.compose.viewModel
 import coil.compose.AsyncImage
 import com.aerith.auth.AuthState
@@ -36,10 +39,11 @@ import com.aerith.core.nostr.BlossomAuthHelper
 import com.aerith.ui.gallery.GalleryViewModel
 import kotlinx.coroutines.launch
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalFoundationApi::class, ExperimentalLayoutApi::class)
 @Composable
 fun GalleryScreen(
     authState: AuthState,
+    authViewModel: com.aerith.auth.AuthViewModel,
     onMediaClick: (String) -> Unit,
     onSettingsClick: () -> Unit,
     galleryViewModel: GalleryViewModel = viewModel(),
@@ -60,6 +64,8 @@ fun GalleryScreen(
     // Bulk Label Dialog State
     var showBulkLabelDialog by remember { mutableStateOf(false) }
     var showBulkDeleteDialog by remember { mutableStateOf(false) }
+    var showFilterSheet by remember { mutableStateOf(false) }
+    val filterSheetState = rememberModalBottomSheetState()
     var bulkTagsInput by remember { mutableStateOf("") }
 
     // Track if we've performed the initial refresh this session
@@ -115,7 +121,7 @@ fun GalleryScreen(
                     // Finished all servers
                     val finalHeaders = authenticatedListHeaders.toMap()
                     authState.pubkey?.let { pk ->
-                        galleryViewModel.loadImages(pk, authState.blossomServers, finalHeaders, authState.fileMetadata)
+                        galleryViewModel.loadImages(pk, authState.blossomServers, finalHeaders, authState.fileMetadata, authState.localBlossomUrl)
                     }
                     pendingListAuth = null
                     currentSigningServer = null
@@ -164,7 +170,7 @@ fun GalleryScreen(
 
             if (remainingServers.isEmpty()) {
                 // All signed in background!
-                galleryViewModel.loadImages(pubkey, servers, headers, authState.fileMetadata)
+                galleryViewModel.loadImages(pubkey, servers, headers, authState.fileMetadata, authState.localBlossomUrl)
                 isSigningFlowActive = false
             } else {
                 // Some or all need UI interaction
@@ -256,8 +262,8 @@ fun GalleryScreen(
 
     // New: Re-sync labels when fresh metadata is discovered on relays
     LaunchedEffect(authState.fileMetadata) {
-        if (authState.pubkey != null && authState.blossomServers.isNotEmpty() && authState.fileMetadata.isNotEmpty()) {
-            galleryViewModel.loadImages(authState.pubkey, authState.blossomServers, state.lastAuthHeaders, authState.fileMetadata)
+        if (authState.pubkey != null && authState.fileMetadata.isNotEmpty()) {
+            galleryViewModel.refreshMetadataOnly(authState.fileMetadata)
         }
     }
 
@@ -282,6 +288,30 @@ fun GalleryScreen(
                         label = { Text("Labels (e.g. nature, holiday)") },
                         modifier = Modifier.fillMaxWidth()
                     )
+
+                    // Suggestions
+                    val allUniqueTags = galleryViewModel.getAllUniqueTags()
+                    if (allUniqueTags.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Existing tags:", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.secondary)
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            allUniqueTags.take(15).forEach { tag ->
+                                AssistChip(
+                                    onClick = {
+                                        val current = bulkTagsInput.split(",").map { it.trim() }.filter { it.isNotEmpty() }
+                                        if (tag !in current) {
+                                            val newList = (current + tag).joinToString(", ")
+                                            bulkTagsInput = newList
+                                        }
+                                    },
+                                    label = { Text(tag) }
+                                )
+                            }
+                        }
+                    }
                 }
             },
             confirmButton = {
@@ -332,6 +362,44 @@ fun GalleryScreen(
         )
     }
 
+    if (showFilterSheet) {
+        ModalBottomSheet(
+            onDismissRequest = { showFilterSheet = false },
+            sheetState = filterSheetState
+        ) {
+            Column(modifier = Modifier.padding(16.dp).padding(bottom = 32.dp)) {
+                Text("Filter Media", style = MaterialTheme.typography.headlineSmall)
+                Spacer(modifier = Modifier.height(16.dp))
+                
+                Text("Media Type", style = MaterialTheme.typography.titleMedium)
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Checkbox(checked = state.showImages, onCheckedChange = { galleryViewModel.toggleShowImages() })
+                    Text("Show Images")
+                    Spacer(modifier = Modifier.width(16.dp))
+                    Checkbox(checked = state.showVideos, onCheckedChange = { galleryViewModel.toggleShowVideos() })
+                    Text("Show Videos")
+                }
+                
+                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
+                
+                Text("File Types", style = MaterialTheme.typography.titleMedium)
+                Spacer(modifier = Modifier.height(8.dp))
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    galleryViewModel.getAvailableExtensions().forEach { ext ->
+                        FilterChip(
+                            selected = state.selectedExtensions.contains(ext),
+                            onClick = { galleryViewModel.toggleExtension(ext) },
+                            label = { Text(ext.uppercase()) }
+                        )
+                    }
+                }
+            }
+        }
+    }
+
     Scaffold(
         topBar = {
             if (isSelectionMode) {
@@ -349,7 +417,7 @@ fun GalleryScreen(
                         IconButton(onClick = {
                             val pk = authState.pubkey
                             if (pk != null) {
-                                galleryViewModel.bulkMirrorToAll(pk, state.selectedHashes, authState.blossomServers, signer, authState.signerPackage)
+                                galleryViewModel.bulkMirrorToAll(pk, state.selectedHashes, authState.blossomServers, signer, authState.signerPackage, authState.localBlossomUrl)
                             }
                         }) {
                             Icon(Icons.Default.CloudSync, "Mirror to All")
@@ -435,7 +503,7 @@ fun GalleryScreen(
                                             }
                                         )
                                     }
-                                    Divider()
+                                    HorizontalDivider()
                                     DropdownMenuItem(
                                         text = { Text("Trash") },
                                         onClick = {
@@ -480,14 +548,26 @@ fun GalleryScreen(
             }
         }
     ) { padding ->
-        val allTags = remember(state.allBlobs, state.trashBlobs, state.fileMetadata) {
-            (state.allBlobs + state.trashBlobs).flatMap { it.getTags(state.fileMetadata) }.distinct().sorted()
+        val allTags = remember(state.filteredBlobs, state.selectedTags, state.fileMetadata) {
+            // Count frequency of each tag in the current filtered results
+            val counts = state.filteredBlobs
+                .flatMap { it.getTags(state.fileMetadata) }
+                .groupingBy { it }
+                .eachCount()
+
+            val visibleTags = counts.keys
+            val selected = state.selectedTags.filter { it in visibleTags || state.selectedTags.contains(it) }
+            val others = (visibleTags - state.selectedTags.toSet()).sorted()
+            
+            (selected + others).distinct().map { tag ->
+                tag to (counts[tag] ?: 0)
+            }
         }
 
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
             // Background update/upload/mirror indicator
-            val isBusy = uploadState.isUploading || state.isLoading
-            val progressText = uploadState.progress ?: state.loadingMessage
+            val isBusy = uploadState.isUploading || state.isLoading || state.localSyncProgress != null
+            val progressText = uploadState.progress ?: state.loadingMessage ?: state.localSyncProgress
 
             if (isBusy) {
                 Column(modifier = Modifier.fillMaxWidth()) {
@@ -507,30 +587,55 @@ fun GalleryScreen(
                 }
             }
 
-            if (allTags.isNotEmpty()) {
-                ScrollableTabRow(
-                    selectedTabIndex = -1,
-                    edgePadding = 16.dp,
-                    containerColor = Color.Transparent,
-                    divider = {},
-                    indicator = {}
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                IconButton(
+                    onClick = { showFilterSheet = true },
+                    modifier = Modifier.padding(start = 8.dp)
                 ) {
-                    allTags.forEach { tag ->
-                        val isSelected = state.selectedTags.contains(tag)
-                        FilterChip(
-                            selected = isSelected,
-                            onClick = { galleryViewModel.toggleTag(tag) },
-                            label = { Text(tag) },
-                            modifier = Modifier.padding(horizontal = 4.dp),
-                            leadingIcon = if (isSelected) {
-                                { Icon(Icons.Default.Check, null, modifier = Modifier.size(16.dp)) }
-                            } else null
-                        )
-                    }
-                    if (state.selectedTags.isNotEmpty()) {
-                        TextButton(onClick = { galleryViewModel.clearTags() }) {
-                            Text("Clear")
+                    Icon(Icons.Default.FilterList, "Filter Options", tint = MaterialTheme.colorScheme.primary)
+                }
+
+                if (allTags.isNotEmpty()) {
+                    ScrollableTabRow(
+                        selectedTabIndex = -1,
+                        edgePadding = 8.dp,
+                        containerColor = Color.Transparent,
+                        modifier = Modifier.weight(1f),
+                        divider = {},
+                        indicator = {}
+                    ) {
+                        allTags.forEach { (tag, count) ->
+                            val isSelected = state.selectedTags.contains(tag)
+                            FilterChip(
+                                selected = isSelected,
+                                onClick = { galleryViewModel.toggleTag(tag) },
+                                label = { 
+                                    Text(
+                                        text = if (count > 0) "$tag $count" else tag,
+                                        style = MaterialTheme.typography.labelSmall,
+                                        fontSize = 11.sp
+                                    ) 
+                                },
+                                modifier = Modifier.padding(horizontal = 4.dp),
+                                leadingIcon = if (isSelected) {
+                                    { Icon(Icons.Default.Check, null, modifier = Modifier.size(14.dp)) }
+                                } else null
+                            )
                         }
+                    }
+                } else {
+                    Spacer(modifier = Modifier.weight(1f))
+                }
+                
+                if (state.selectedTags.isNotEmpty()) {
+                    TextButton(
+                        onClick = { galleryViewModel.clearTags() },
+                        modifier = Modifier.padding(end = 8.dp)
+                    ) {
+                        Text("Clear")
                     }
                 }
             }
@@ -577,10 +682,23 @@ fun GalleryScreen(
                             key = { it.sha256 } // Stable keys for high-performance scrolling
                         ) { blob ->
                             val isSelected = state.selectedHashes.contains(blob.sha256)
+                            val isPinned = state.pinnedHashes.contains(blob.sha256)
+                            val isLocallyCached = state.locallyCachedHashes.contains(blob.sha256)
+                            val serverCount = remember(state.allBlobs, blob.sha256, isLocallyCached) {
+                                val remoteCount = state.allBlobs.filter { it.sha256 == blob.sha256 }.mapNotNull { it.serverUrl }.distinct().size
+                                if (isLocallyCached) remoteCount + 1 else remoteCount
+                            }
+
                             MediaItem(
                                 blob = blob,
                                 isSelected = isSelected,
                                 inSelectionMode = isSelectionMode,
+                                isPinned = isPinned,
+                                isLocallyCached = isLocallyCached,
+                                localUrl = authState.localBlossomUrl,
+                                serverCount = serverCount,
+                                isServerBadgeEnabled = state.isServerBadgeEnabled,
+                                isFileTypeBadgeEnabled = state.isFileTypeBadgeEnabled,
                                 onClick = { 
                                     if (isSelectionMode) {
                                         galleryViewModel.toggleSelection(blob.sha256)
@@ -606,17 +724,32 @@ fun MediaItem(
     blob: BlossomBlob, 
     isSelected: Boolean,
     inSelectionMode: Boolean,
+    isPinned: Boolean,
+    isLocallyCached: Boolean,
+    localUrl: String?,
+    serverCount: Int,
+    isServerBadgeEnabled: Boolean,
+    isFileTypeBadgeEnabled: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit
 ) {
     val isVideo = remember(blob.type, blob.mime) { 
         blob.getMimeType()?.startsWith("video/") == true 
     }
+    val extension = remember(blob.type, blob.mime) {
+        blob.getMimeType()?.substringAfterLast("/")?.substringBefore(";")?.uppercase() ?: "???"
+    }
     val context = LocalContext.current
     
-    val imageRequest = remember(blob.sha256, blob.url) {
+    val imageRequest = remember(blob.sha256, blob.url, isPinned, isLocallyCached) {
+        val model = when {
+            isPinned -> java.io.File(context.filesDir, "persistent_media/${blob.sha256}")
+            isLocallyCached && localUrl != null -> "$localUrl/${blob.sha256}"
+            else -> blob.getThumbnailUrl()
+        }
+
         coil.request.ImageRequest.Builder(context)
-            .data(blob.getThumbnailUrl())
+            .data(model)
             .diskCacheKey(blob.sha256)
             .memoryCacheKey(blob.sha256)
             .size(400, 400)
@@ -641,6 +774,49 @@ fun MediaItem(
             contentScale = ContentScale.Crop,
             modifier = Modifier.fillMaxSize()
         )
+
+        // --- Badges ---
+        
+        // 1. Top Left: Server Count (Circular)
+        if (isServerBadgeEnabled && serverCount > 0) {
+            Box(
+                modifier = Modifier
+                    .padding(4.dp)
+                    .align(Alignment.TopStart)
+                    .size(20.dp)
+                    .background(
+                        color = if (isLocallyCached) Color(0xFFC8E6C9) else Color.White, 
+                        shape = CircleShape
+                    ),
+                contentAlignment = Alignment.Center
+            ) {
+                Text(
+                    text = serverCount.toString(),
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.Black,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                )
+            }
+        }
+
+        // 2. Bottom Left: File Extension (Pill)
+        if (isFileTypeBadgeEnabled) {
+            Box(
+                modifier = Modifier
+                    .padding(4.dp)
+                    .align(Alignment.BottomStart)
+                    .background(Color.White, MaterialTheme.shapes.extraSmall)
+                    .padding(horizontal = 3.dp, vertical = 0.5.dp)
+            ) {
+                Text(
+                    text = extension,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.Black,
+                    fontSize = 8.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                )
+            }
+        }
         
         if (isVideo) {
             Box(

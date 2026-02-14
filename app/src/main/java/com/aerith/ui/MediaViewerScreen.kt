@@ -11,6 +11,7 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -49,6 +50,7 @@ import java.io.File
 fun MediaViewerScreen(
     url: String,
     authState: AuthState,
+    authViewModel: com.aerith.auth.AuthViewModel,
     galleryViewModel: GalleryViewModel = viewModel()
 ) {
     val uiState by galleryViewModel.uiState.collectAsState()
@@ -59,7 +61,13 @@ fun MediaViewerScreen(
     val currentBlob = remember(uiState.allBlobs, uiState.trashBlobs, url) { 
         uiState.allBlobs.find { it.url == url } ?: uiState.trashBlobs.find { it.url == url }
     }
+    val isPinned = remember(currentBlob, uiState.pinnedHashes) {
+        currentBlob != null && uiState.pinnedHashes.contains(currentBlob.sha256)
+    }
     val isVideo = remember(currentBlob) { currentBlob?.getMimeType()?.startsWith("video/") == true }
+    val isLocallyCached = remember(currentBlob, uiState.locallyCachedHashes) {
+        currentBlob != null && uiState.locallyCachedHashes.contains(currentBlob.sha256)
+    }
 
     val exoPlayer = remember {
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
@@ -79,9 +87,14 @@ fun MediaViewerScreen(
             }
     }
 
-    LaunchedEffect(url) {
+    LaunchedEffect(url, isPinned, isLocallyCached) {
         if (isVideo) {
-            val mediaItem = MediaItem.fromUri(url)
+            val mediaUri = when {
+                isPinned && currentBlob != null -> Uri.fromFile(java.io.File(context.filesDir, "persistent_media/${currentBlob.sha256}"))
+                isLocallyCached && currentBlob != null && authState.localBlossomUrl != null -> Uri.parse("${authState.localBlossomUrl}/${currentBlob.sha256}")
+                else -> Uri.parse(url)
+            }
+            val mediaItem = MediaItem.fromUri(mediaUri)
             exoPlayer.setMediaItem(mediaItem)
             exoPlayer.prepare()
         }
@@ -142,11 +155,24 @@ fun MediaViewerScreen(
                     file = snapshot?.data?.toFile()
                 }
 
-                // 2. If not in cache or is video, download to a temp file for sharing
+                // 2. If not in cache, check persistent storage or local blossom
+                if (file == null || !file.exists()) {
+                    val persistentFile = File(context.filesDir, "persistent_media/$hash")
+                    if (persistentFile.exists()) {
+                        file = persistentFile
+                    }
+                }
+
+                // 3. If still not found or is video, download to a temp file for sharing
                 if (file == null || !file.exists()) {
                     val tempFile = File(context.cacheDir, "temp_share_${System.currentTimeMillis()}.${mimeType.substringAfter("/")}")
                     try {
-                        val request = okhttp3.Request.Builder().url(url).build()
+                        val effectiveUrl = if (isLocallyCached && currentBlob != null && authState.localBlossomUrl != null) {
+                            "${authState.localBlossomUrl}/$hash"
+                        } else {
+                            url
+                        }
+                        val request = okhttp3.Request.Builder().url(effectiveUrl).build()
                         val client = okhttp3.OkHttpClient()
                         client.newCall(request).execute().use { response ->
                             if (response.isSuccessful) {
@@ -207,9 +233,15 @@ fun MediaViewerScreen(
                 modifier = Modifier.fillMaxSize()
             )
         } else {
+            val model = when {
+                isPinned && currentBlob != null -> java.io.File(context.filesDir, "persistent_media/${currentBlob.sha256}")
+                isLocallyCached && currentBlob != null && authState.localBlossomUrl != null -> "${authState.localBlossomUrl}/${currentBlob.sha256}"
+                else -> url
+            }
+
             SubcomposeAsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
-                    .data(url)
+                    .data(model)
                     .diskCacheKey(currentBlob?.sha256)
                     .memoryCacheKey(currentBlob?.sha256)
                     .build(),
@@ -222,6 +254,35 @@ fun MediaViewerScreen(
                     }
                 }
             )
+        }
+
+        // --- Fast Local indicator ---
+        if (isLocallyCached && !isVideo) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.TopEnd)
+                    .padding(16.dp)
+                    .padding(WindowInsets.statusBars.asPaddingValues())
+                    .background(Color.Black.copy(alpha = 0.4f), CircleShape)
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
+                contentAlignment = Alignment.Center
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Icon(
+                        Icons.Default.FlashOn, 
+                        null, 
+                        tint = Color(0xFFC8E6C9), 
+                        modifier = Modifier.size(14.dp)
+                    )
+                    Spacer(Modifier.width(4.dp))
+                    Text(
+                        "LOCAL", 
+                        style = MaterialTheme.typography.labelSmall, 
+                        color = Color.White,
+                        fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                    )
+                }
+            }
         }
         
         // Bottom Bar with Actions
@@ -299,6 +360,7 @@ fun MediaViewerScreen(
                                         val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
                                         if (signed != null) {
                                             galleryViewModel.updateLabels(pk, authState.relays, currentBlob, updatedTags, signed, signer, pkg)
+                                            authViewModel.updateMetadata(currentBlob.sha256, updatedTags)
                                         } else {
                                             pendingLabelUpdateTags = updatedTags
                                             signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
@@ -332,6 +394,7 @@ fun MediaViewerScreen(
                                         
                                         if (signed != null) {
                                             galleryViewModel.updateLabels(pk, authState.relays, currentBlob, updatedTags, signed, signer, pkg)
+                                            authViewModel.updateMetadata(currentBlob.sha256, updatedTags)
                                             newTag = ""
                                         } else {
                                             pendingLabelUpdateTags = updatedTags
@@ -346,7 +409,42 @@ fun MediaViewerScreen(
                         }
                     )
 
-                    Divider(modifier = Modifier.padding(vertical = 16.dp))
+                    // Suggestions
+                    val allUniqueTags = galleryViewModel.getAllUniqueTags()
+                    val suggestedTags = allUniqueTags.filter { it !in currentTags }
+                    
+                    if (suggestedTags.isNotEmpty()) {
+                        Spacer(modifier = Modifier.height(8.dp))
+                        Text("Suggested:", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.secondary)
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            suggestedTags.take(10).forEach { tag ->
+                                AssistChip(
+                                    onClick = {
+                                        if (pk != null) {
+                                            val updatedTags = (currentTags + tag).distinct()
+                                            val unsigned = BlossomAuthHelper.createFileMetadataEvent(
+                                                pk, currentBlob.sha256, url, currentBlob.getMimeType(), updatedTags
+                                            )
+                                            val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
+                                            if (signed != null) {
+                                                galleryViewModel.updateLabels(pk, authState.relays, currentBlob, updatedTags, signed, signer, pkg)
+                                                authViewModel.updateMetadata(currentBlob.sha256, updatedTags)
+                                            } else {
+                                                pendingLabelUpdateTags = updatedTags
+                                                signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
+                                            }
+                                        }
+                                    },
+                                    label = { Text(tag) }
+                                )
+                            }
+                        }
+                    }
+
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
                     
                     Text("Metadata", style = MaterialTheme.typography.titleMedium)
                     Spacer(modifier = Modifier.height(8.dp))
@@ -387,6 +485,43 @@ fun MediaViewerScreen(
                     Spacer(modifier = Modifier.height(8.dp))
                     
                     LazyColumn {
+                        // 1. Show Local Cache if detected
+                        authState.localBlossomUrl?.let { localUrl ->
+                            item {
+                                val isMirroring = uiState.serverMirroringStates[localUrl] ?: false
+
+                                Row(
+                                    modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp),
+                                    horizontalArrangement = Arrangement.SpaceBetween,
+                                    verticalAlignment = Alignment.CenterVertically
+                                ) {
+                                    Column(modifier = Modifier.weight(1f)) {
+                                        Text("Local Cache", style = MaterialTheme.typography.bodyLarge)
+                                        Text(
+                                            text = if (isLocallyCached) "Stored locally" else "Available for sync",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (isLocallyCached) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.secondary
+                                        )
+                                    }
+                                    
+                                    if (isMirroring) {
+                                        CircularProgressIndicator(modifier = Modifier.size(24.dp).padding(4.dp), strokeWidth = 2.dp)
+                                    } else if (!isLocallyCached) {
+                                        IconButton(onClick = {
+                                            if (currentBlob != null) {
+                                                galleryViewModel.mirrorToLocalCache(currentBlob.sha256, url, currentBlob, localUrl)
+                                            }
+                                        }) {
+                                            Icon(Icons.Default.DownloadForOffline, "Save to Local Cache", tint = MaterialTheme.colorScheme.primary)
+                                        }
+                                    } else {
+                                        Icon(Icons.Default.CheckCircle, "Cached", tint = MaterialTheme.colorScheme.primary, modifier = Modifier.padding(8.dp))
+                                    }
+                                }
+                                HorizontalDivider(modifier = Modifier.padding(vertical = 4.dp))
+                            }
+                        }
+
                         items(authState.blossomServers) { server ->
                             val isOnServer = relatedBlobs.any { it.serverUrl == server }
                             

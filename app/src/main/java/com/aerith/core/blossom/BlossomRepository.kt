@@ -13,6 +13,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaTypeOrNull
 import okhttp3.OkHttpClient
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
@@ -27,6 +28,10 @@ import java.util.concurrent.TimeUnit
 class BlossomRepository(private val context: Context) {
 
     private data class ProcessedFile(val bytes: ByteArray, val hash: String, val size: Long)
+
+    private fun normalizeUrl(url: String): String {
+        return url.removeSuffix("/").lowercase()
+    }
 
     private val client = OkHttpClient.Builder()
         .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.HEADERS })
@@ -44,57 +49,148 @@ class BlossomRepository(private val context: Context) {
     )
 
     /**
-     * Fetches files from multiple servers using OkHttp for detailed logging.
+     * Checks if a local Blossom cache is running on the device.
+     * Per documentation: HEAD http://127.0.0.1:24242
+     * Also checks 10.0.2.2 for emulator support.
      */
+    suspend fun detectLocalBlossom(): String? = withContext(Dispatchers.IO) {
+        val hosts = listOf("127.0.0.1", "10.0.2.2")
+        for (host in hosts) {
+            val url = "http://$host:24242"
+            val request = Request.Builder()
+                .url(url)
+                .head()
+                .build()
+            
+            try {
+                client.newCall(request).execute().use { response ->
+                    if (response.isSuccessful || response.code == 401 || response.code == 404) {
+                        Log.i("BlossomRepo", "Detected local Blossom cache at $url")
+                        return@withContext url
+                    }
+                }
+            } catch (e: Exception) {
+                // Continue to next host
+            }
+        }
+        null
+    }
+
+    /**
+     * Efficiently checks if a blob exists on a server using HEAD.
+     */
+    suspend fun checkBlobExists(serverUrl: String, hash: String): Boolean = withContext(Dispatchers.IO) {
+        val cleanServer = serverUrl.removeSuffix("/")
+        val url = "$cleanServer/$hash"
+        val request = Request.Builder().url(url).head().build()
+        try {
+            client.newCall(request).execute().use { response ->
+                response.isSuccessful
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Instructs the local cache to fetch a blob from a remote server.
+     * Per documentation: GET /<sha256>?xs=<server>
+     */
+    suspend fun fetchToLocalCache(hash: String, sourceUrl: String, localUrl: String): Result<Unit> = withContext(Dispatchers.IO) {
+        val cleanLocal = localUrl.trim().removeSuffix("/")
+        val cleanHash = hash.trim().lowercase()
+        
+        // Extract server root from sourceUrl (e.g., https://server.com/hash.jpg -> https://server.com)
+        val serverRoot = try {
+            val uri = Uri.parse(sourceUrl)
+            "${uri.scheme}://${uri.host}${if (uri.port != -1 && uri.port != 80 && uri.port != 443) ":${uri.port}" else ""}"
+        } catch (e: Exception) {
+            sourceUrl.substringBeforeLast("/")
+        }.trim()
+
+        // Include extension in path so local server knows what to fetch
+        val extension = sourceUrl.substringAfterLast("/", "").let { 
+            val segment = it.substringBefore("?")
+            if (segment.contains(".")) "." + segment.substringAfterLast(".") else ""
+        }.trim()
+
+        val url = cleanLocal.toHttpUrlOrNull()?.newBuilder()
+            ?.addPathSegment("$cleanHash$extension")
+            ?.addQueryParameter("xs", serverRoot)
+            ?.build() ?: throw Exception("Invalid local URL: $cleanLocal")
+
+        Log.d("BlossomRepo", "Local cache proxy-fetch: $url")
+        val request = Request.Builder().url(url).get().build()
+
+        try {
+            client.newCall(request).execute().use { response ->
+                if (response.isSuccessful) Result.success(Unit)
+                else Result.failure(Exception("Local cache fetch failed: ${response.code}"))
+            }
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
+    }
+
     suspend fun getFilesFromServers(
         pubkey: String, 
         servers: List<String>,
         authHeaders: Map<String, String> = emptyMap()
     ): List<BlossomBlob> = withContext(Dispatchers.IO) {
+        val normalizedHeaders = authHeaders.mapKeys { normalizeUrl(it.key) }
+        
         val deferredResults = servers.map { server ->
             async {
                 val cleanServer = server.removeSuffix("/")
+                val normalizedServer = normalizeUrl(server)
+                val isLocal = cleanServer.contains("127.0.0.1") || cleanServer.contains("localhost")
                 val url = "$cleanServer/list/$pubkey"
-                val authHeader = authHeaders[server] ?: authHeaders[cleanServer]
+                val authHeader = normalizedHeaders[normalizedServer] ?: normalizedHeaders[cleanServer]
                 
                 Log.d("BlossomRepo", "Fetching list from: $url")
                 
                 suspend fun tryFetch(headerValue: String?): List<BlossomBlob>? {
-                    val request = Request.Builder()
-                        .url(url)
-                        .apply {
-                            if (headerValue != null) header("Authorization", headerValue)
-                        }
-                        .header("User-Agent", "Aerith/1.0")
-                        .build()
-
-                    return try {
-                        client.newCall(request).execute().use { response ->
-                            val code = response.code
-                            val bodyString = response.body?.string() ?: ""
-                            
-                            if (code == 200) {
-                                val blobs = listAdapter.fromJson(bodyString) ?: emptyList()
-                                Log.i("BlossomRepo", "SUCCESS from $cleanServer with prefix ${headerValue?.take(10)}")
-                                blobs.map { it.copy(serverUrl = server) }
-                            } else if (code == 401) {
-                                Log.w("BlossomRepo", "401 from $cleanServer with ${headerValue?.take(10)}")
-                                null // Try next prefix
-                            } else {
-                                Log.w("BlossomRepo", "List failed for $cleanServer: HTTP $code - ${bodyString.take(100)}")
-                                emptyList<BlossomBlob>()
+                    var lastException: Exception? = null
+                    for (attempt in 1..2) { // Simple retry for transient errors
+                        val request = Request.Builder()
+                            .url(url)
+                            .apply {
+                                if (headerValue != null) header("Authorization", headerValue)
                             }
+                            .header("User-Agent", "Aerith/1.0")
+                            .build()
+
+                        try {
+                            client.newCall(request).execute().use { response ->
+                                val code = response.code
+                                val bodyString = response.body?.string() ?: ""
+                                
+                                if (code == 200) {
+                                    val blobs = listAdapter.fromJson(bodyString) ?: emptyList()
+                                    Log.i("BlossomRepo", "SUCCESS from $cleanServer with prefix ${headerValue?.take(10)}")
+                                    return blobs.map { it.copy(serverUrl = server) }
+                                } else if (code == 401 && !isLocal) {
+                                    Log.w("BlossomRepo", "401 from $cleanServer with ${headerValue?.take(10)}")
+                                    return null // Try next prefix
+                                } else {
+                                    Log.w("BlossomRepo", "List failed for $cleanServer: HTTP $code - ${bodyString.take(100)}")
+                                    return emptyList<BlossomBlob>()
+                                }
+                            }
+                        } catch (e: Exception) {
+                            lastException = e
+                            Log.w("BlossomRepo", "Attempt $attempt failed for $server: ${e.message}")
+                            if (attempt < 2) kotlinx.coroutines.delay(500)
                         }
-                    } catch (e: Exception) {
-                        Log.e("BlossomRepo", "Network error fetching from $server", e)
-                        emptyList<BlossomBlob>()
                     }
+                    Log.e("BlossomRepo", "All attempts failed for $server", lastException)
+                    return emptyList<BlossomBlob>()
                 }
 
                 // Strategy: Try original (Nostr), then try swapping prefix to Blossom
                 var result = tryFetch(authHeader)
                 
-                if (result == null && authHeader != null && authHeader.startsWith("Nostr ")) {
+                if (result == null && authHeader != null && authHeader.startsWith("Nostr ") && !isLocal) {
                     val blossomHeader = authHeader.replaceFirst("Nostr ", "Blossom ")
                     Log.d("BlossomRepo", "Retrying $cleanServer with 'Blossom' prefix...")
                     result = tryFetch(blossomHeader)
@@ -309,12 +405,12 @@ class BlossomRepository(private val context: Context) {
         Log.i("BlossomRepo", "Attempting to mirror $sourceUrl to $cleanServer")
         var lastError = ""
 
-        suspend fun tryMirror(header: String): BlossomUploadResult? {
+        suspend fun tryMirror(header: String, method: String): BlossomUploadResult? {
             val jsonBody = JSONObject().put("url", sourceUrl).toString()
             val requestBody = jsonBody.toRequestBody("application/json".toMediaTypeOrNull())
             val request = Request.Builder()
                 .url("$cleanServer/mirror")
-                .put(requestBody)
+                .method(method, requestBody)
                 .header("Authorization", header)
                 .header("Content-Type", "application/json")
                 .header("User-Agent", "Aerith/1.0")
@@ -322,17 +418,19 @@ class BlossomRepository(private val context: Context) {
             
             return try {
                 client.newCall(request).execute().use { response ->
+                    val body = response.body?.string() ?: ""
                     if (response.isSuccessful) {
-                        Log.i("BlossomRepo", "Mirror SUCCEEDED for $sourceUrl on $cleanServer with prefix ${header.take(10)}")
-                        parseUploadResponse(response.body?.string(), cleanServer)
+                        Log.i("BlossomRepo", "Mirror SUCCEEDED ($method) for $sourceUrl on $cleanServer with prefix ${header.take(10)}")
+                        parseUploadResponse(body, cleanServer)
+                    } else if (response.code == 401) {
+                        null // Try next prefix
                     } else {
-                        val errorBody = response.body?.string() ?: "No response body"
-                        lastError += " | Mirror (${header.take(10)}): ${response.code} - ${errorBody.take(100)}"
+                        lastError += " | $method Mirror (${header.take(10)}): ${response.code} - ${body.take(100)}"
                         null
                     }
                 }
             } catch (e: Exception) {
-                lastError += " | Mirror exception: ${e.message}"
+                lastError += " | $method Mirror exception: ${e.message}"
                 null
             }
         }
@@ -343,7 +441,8 @@ class BlossomRepository(private val context: Context) {
             val currentHeader = if (authHeader.startsWith("Nostr ")) authHeader.replaceFirst("Nostr ", prefix) 
                                else authHeader.replaceFirst("Blossom ", prefix)
             
-            val result = tryMirror(currentHeader)
+            // Try PUT then POST for each prefix
+            val result = tryMirror(currentHeader, "PUT") ?: tryMirror(currentHeader, "POST")
             if (result != null) return@withContext Result.success(result)
         }
 
