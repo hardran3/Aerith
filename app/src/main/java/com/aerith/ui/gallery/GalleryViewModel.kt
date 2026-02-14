@@ -46,6 +46,9 @@ data class GalleryState(
     // Track which servers are currently performing a mirror operation
     val serverMirroringStates: Map<String, Boolean> = emptyMap(),
 
+    // For the new discovery flow
+    val discoveredBlobs: List<BlossomBlob> = emptyList(), // Found via relays
+    
     // For the new 2-step upload flow
     val preparedUploadHash: String? = null,
     val preparedUploadSize: Long? = null
@@ -227,7 +230,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
 
             // Merge metadata: Incoming relay data < Current UI state
-            // This ensures optimistic updates aren't killed by background refreshes
             val mergedMeta = (externalMetadata + _uiState.value.fileMetadata).toMutableMap()
 
             mediaBlobs = mediaBlobs.map { blob ->
@@ -260,11 +262,11 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 .distinct()
                 .sorted()
             
-            // Check if anything actually changed before triggering a full UI update
+            // Check if anything actually changed
             val hasChanged = _uiState.value.allBlobs != mediaBlobs || 
                              _uiState.value.trashBlobs != combinedTrash ||
                              effectiveHeaders != _uiState.value.lastAuthHeaders ||
-                             _uiState.value.isLoading // if it was showing spinner, we must finish it
+                             _uiState.value.isLoading
 
             if (hasChanged) {
                 _uiState.value = _uiState.value.copy(
@@ -462,18 +464,32 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     
     private fun applyFilter() {
         val current = _uiState.value
+        
+        // 1. Determine base set of blobs
         var filtered = when (current.selectedServer) {
-            null -> current.allBlobs.distinctBy { it.sha256 }
+            null -> {
+                // All Media: Combine server blobs + discovered blobs (deduplicated by hash)
+                (current.allBlobs + current.discoveredBlobs).distinctBy { it.sha256 }
+            }
             "TRASH" -> current.trashBlobs.distinctBy { it.sha256 }
+            "NOSTR" -> {
+                // Nostr: Show only files found via 1063 that ARE NOT confirmed on any remote server
+                current.discoveredBlobs
+                    .filter { disc -> current.allBlobs.none { it.sha256 == disc.sha256 } }
+                    .distinctBy { it.sha256 }
+            }
             current.localServerUrl -> {
-                // Local cache is an overlay: show everything (active + trash) that is cached
-                (current.allBlobs + current.trashBlobs)
+                // Local cache overlay
+                (current.allBlobs + current.trashBlobs + current.discoveredBlobs)
                     .filter { it.sha256 in current.locallyCachedHashes }
                     .distinctBy { it.sha256 }
             }
-            else -> current.allBlobs
-                .filter { it.serverUrl == current.selectedServer }
-                .distinctBy { it.sha256 }
+            else -> {
+                // Specific server: Only show files confirmed to be on that server
+                current.allBlobs
+                    .filter { it.serverUrl == current.selectedServer }
+                    .distinctBy { it.sha256 }
+            }
         }
 
         // Filter by Media Type
@@ -546,6 +562,25 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             val result = repository.uploadBytes(server, uri, mimeType, authHeader, expectedHash)
             _uiState.value = _uiState.value.copy(isLoading = false, error = if (result.isFailure) result.exceptionOrNull()?.message else null)
             _uiState.value = _uiState.value.copy(preparedUploadHash = null, preparedUploadSize = null)
+        }
+    }
+
+    /**
+     * Checks if a blob exists on a server (low-impact HEAD) and updates state if confirmed.
+     */
+    fun verifyBlobExistence(server: String, originalBlob: BlossomBlob) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val exists = repository.checkBlobExists(server, originalBlob.sha256)
+            if (exists) {
+                withContext(Dispatchers.Main) {
+                    val cleanServer = server.removeSuffix("/")
+                    val newBlob = originalBlob.copy(url = "$cleanServer/${originalBlob.sha256}", serverUrl = server)
+                    val newAll = (_uiState.value.allBlobs + newBlob).distinctBy { it.serverUrl + it.sha256 }
+                    _uiState.value = _uiState.value.copy(allBlobs = newAll)
+                    applyFilter()
+                    saveCache(newAll, _uiState.value.trashBlobs, _uiState.value.fileMetadata)
+                }
+            }
         }
     }
 

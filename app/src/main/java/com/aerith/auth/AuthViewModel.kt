@@ -26,7 +26,7 @@ data class AuthState(
     val profileName: String? = null,
     val signerPackage: String? = null,
     val localBlossomUrl: String? = null,
-    val fileMetadata: Map<String, List<List<String>>> = emptyMap(), // hash -> List of tags [["t", "tag"], ["name", "file"]]
+    val fileMetadata: Map<String, List<List<String>>> = emptyMap(), // hash -> List of tags
     val isLoading: Boolean = false,
     val error: String? = null
 )
@@ -360,11 +360,12 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                 event.tags.find { it.firstOrNull() == "x" }?.getOrNull(1)?.lowercase()
             }.forEach { (hash, events) ->
                 if (hash != null) {
-                    val latest = events.maxByOrNull { it.createdAt }
-                    // Keep all NIP-94 relevant tags
-                    val relevantTags = latest?.tags?.filter { tag ->
+                    val latest = events.maxByOrNull { it.createdAt } ?: return@forEach
+                    
+                    // Extract Tags for Global Cache
+                    val relevantTags = latest.tags.filter { tag ->
                         tag.firstOrNull() in listOf("t", "name", "alt", "summary", "thumb", "blurhash", "dim")
-                    } ?: emptyList()
+                    }
                     metadataMap[hash] = relevantTags
                 }
             }
@@ -372,14 +373,12 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
             withContext(Dispatchers.Main) {
                 if (metadataMap.isNotEmpty()) {
                     val currentMetadata = _uiState.value.fileMetadata.toMutableMap()
-                    // Update current metadata with fresh data from relays
-                    metadataMap.forEach { (h, t) ->
-                        currentMetadata[h] = t
-                    }
+                    metadataMap.forEach { (h, t) -> currentMetadata[h] = t }
                     
-                    _uiState.value = _uiState.value.copy(fileMetadata = currentMetadata)
+                    _uiState.value = _uiState.value.copy(
+                        fileMetadata = currentMetadata
+                    )
                     
-                    // Save to cache
                     saveMetadataToCache(currentMetadata)
                 }
             }

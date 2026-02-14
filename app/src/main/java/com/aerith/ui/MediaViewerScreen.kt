@@ -11,7 +11,9 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
@@ -116,6 +118,7 @@ fun MediaViewerScreen(
 
     var showInfoSheet by remember { mutableStateOf(false) }
     var showServerSheet by remember { mutableStateOf(false) }
+    var showJsonDialog by remember { mutableStateOf(false) }
     val infoSheetState = rememberModalBottomSheetState()
     val serverSheetState = rememberModalBottomSheetState()
     
@@ -533,16 +536,101 @@ fun MediaViewerScreen(
                     
                     Text("Metadata", style = MaterialTheme.typography.titleMedium)
                     Spacer(modifier = Modifier.height(8.dp))
+                    
+                    val isDiscovered = uiState.allBlobs.none { it.sha256 == currentBlob.sha256 }
+                    if (isDiscovered) {
+                        Text(
+                            text = "Source: Discovered via Nostr Relay (Kind 1063)",
+                            color = MaterialTheme.colorScheme.primary,
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                        Spacer(modifier = Modifier.height(4.dp))
+                    }
+
                     Text("Type: ${currentBlob.getMimeType()}")
                     Text("Size: ${currentBlob.getSizeAsLong()} bytes")
                     Text("SHA256: ${currentBlob.sha256}")
+                    
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(
+                        onClick = { showJsonDialog = true },
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Default.Code, null)
+                        Spacer(Modifier.width(8.dp))
+                        Text("View Kind 1063 JSON")
+                    }
+                    
                     Spacer(modifier = Modifier.height(32.dp))
                 }
             }
         }
 
+        if (showJsonDialog && currentBlob != null) {
+            val json = remember(currentBlob, uiState.fileMetadata) {
+                val currentTags = currentBlob.getTags(uiState.fileMetadata)
+                val unsigned = BlossomAuthHelper.createFileMetadataEvent(
+                    authState.pubkey ?: "", 
+                    currentBlob.sha256, 
+                    url, 
+                    currentBlob.getMimeType(), 
+                    currentTags,
+                    name = currentBlob.getName(uiState.fileMetadata)
+                )
+                org.json.JSONObject(unsigned).toString(4)
+            }
+
+            AlertDialog(
+                onDismissRequest = { showJsonDialog = false },
+                title = { Text("Kind 1063 Event") },
+                text = {
+                    Column {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 400.dp)
+                                .background(MaterialTheme.colorScheme.surfaceVariant, MaterialTheme.shapes.small)
+                                .padding(8.dp)
+                                .verticalScroll(rememberScrollState())
+                        ) {
+                            Text(
+                                text = json,
+                                style = MaterialTheme.typography.bodySmall,
+                                fontFamily = androidx.compose.ui.text.font.FontFamily.Monospace
+                            )
+                        }
+                    }
+                },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val clipboard = context.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                        val clip = android.content.ClipData.newPlainText("Nostr Event JSON", json)
+                        clipboard.setPrimaryClip(clip)
+                        android.widget.Toast.makeText(context, "JSON copied to clipboard", android.widget.Toast.LENGTH_SHORT).show()
+                    }) {
+                        Text("Copy JSON")
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { showJsonDialog = false }) {
+                        Text("Close")
+                    }
+                }
+            )
+        }
+
         // --- Server Management Sheet ---
         if (showServerSheet && currentBlob != null) {
+            // Background re-verification: Check servers that didn't list the file
+            LaunchedEffect(showServerSheet) {
+                authState.blossomServers.forEach { server ->
+                    val isOnServer = relatedBlobs.any { it.serverUrl == server }
+                    if (!isOnServer) {
+                        galleryViewModel.verifyBlobExistence(server, currentBlob)
+                    }
+                }
+            }
+
             ModalBottomSheet(
                 onDismissRequest = { showServerSheet = false },
                 sheetState = serverSheetState

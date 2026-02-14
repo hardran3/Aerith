@@ -122,7 +122,10 @@ fun GalleryScreen(
                     // Finished all servers
                     val finalHeaders = authenticatedListHeaders.toMap()
                     authState.pubkey?.let { pk ->
-                        galleryViewModel.loadImages(pk, authState.blossomServers, finalHeaders, authState.fileMetadata, authState.localBlossomUrl)
+                        galleryViewModel.loadImages(
+                            pk, authState.blossomServers, finalHeaders, 
+                            authState.fileMetadata, authState.localBlossomUrl
+                        )
                     }
                     pendingListAuth = null
                     currentSigningServer = null
@@ -171,7 +174,10 @@ fun GalleryScreen(
 
             if (remainingServers.isEmpty()) {
                 // All signed in background!
-                galleryViewModel.loadImages(pubkey, servers, headers, authState.fileMetadata, authState.localBlossomUrl)
+                galleryViewModel.loadImages(
+                    pubkey, servers, headers, 
+                    authState.fileMetadata, authState.localBlossomUrl
+                )
                 isSigningFlowActive = false
             } else {
                 // Some or all need UI interaction
@@ -870,6 +876,12 @@ fun GalleryScreen(
                                 val remoteCount = state.allBlobs.filter { it.sha256 == blob.sha256 }.mapNotNull { it.serverUrl }.distinct().size
                                 if (isLocallyCached) remoteCount + 1 else remoteCount
                             }
+                            val isDiscovered = remember(state.allBlobs, blob.sha256) {
+                                state.allBlobs.none { it.sha256 == blob.sha256 }
+                            }
+                            val hasMetadata = remember(state.fileMetadata, blob.sha256) {
+                                state.fileMetadata.containsKey(blob.sha256.lowercase())
+                            }
 
                             MediaItem(
                                 blob = blob,
@@ -879,6 +891,8 @@ fun GalleryScreen(
                                 isLocallyCached = isLocallyCached,
                                 localUrl = authState.localBlossomUrl,
                                 serverCount = serverCount,
+                                isDiscovered = isDiscovered,
+                                hasMetadata = hasMetadata,
                                 isServerBadgeEnabled = state.isServerBadgeEnabled,
                                 isFileTypeBadgeEnabled = state.isFileTypeBadgeEnabled,
                                 onClick = { 
@@ -910,6 +924,8 @@ fun MediaItem(
     isLocallyCached: Boolean,
     localUrl: String?,
     serverCount: Int,
+    isDiscovered: Boolean = false,
+    hasMetadata: Boolean = false,
     isServerBadgeEnabled: Boolean,
     isFileTypeBadgeEnabled: Boolean,
     onClick: () -> Unit,
@@ -967,7 +983,11 @@ fun MediaItem(
                     .align(Alignment.TopStart)
                     .size(20.dp)
                     .background(
-                        color = if (isLocallyCached) Color(0xFFC8E6C9) else Color.White, 
+                        color = when {
+                            hasMetadata -> Color(0xFFE1BEE7) // Light Purple for 1063
+                            isLocallyCached -> Color(0xFFC8E6C9) // Green for Cached
+                            else -> Color.White
+                        }, 
                         shape = CircleShape
                     ),
                 contentAlignment = Alignment.Center
@@ -981,7 +1001,26 @@ fun MediaItem(
             }
         }
 
-        // 2. Bottom Left: File Extension (Pill)
+        // 2. Top Right: Discovery Badge
+        if (isDiscovered) {
+            Box(
+                modifier = Modifier
+                    .padding(4.dp)
+                    .align(Alignment.TopEnd)
+                    .background(Color(0xFFE1BEE7), CircleShape)
+                    .padding(horizontal = 4.dp, vertical = 1.dp)
+            ) {
+                Text(
+                    text = "RELAY",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = Color.Black,
+                    fontSize = 7.sp,
+                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
+                )
+            }
+        }
+
+        // 3. Bottom Left: File Extension (Pill)
         if (isFileTypeBadgeEnabled) {
             Box(
                 modifier = Modifier
