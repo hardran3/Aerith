@@ -17,15 +17,35 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import androidx.activity.result.contract.ActivityResultContracts
 import com.aerith.ui.GalleryScreen
 import com.aerith.ui.LoginScreen
 import com.aerith.ui.MediaViewerScreen
+import com.aerith.ui.OnboardingScreen
 import com.aerith.ui.SettingsScreen
 import com.aerith.ui.theme.AerithTheme
 
 class MainActivity : ComponentActivity() {
+    private val requestPermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        // Permissions granted, gallery will refresh vaulted hashes automatically
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        
+        // Request media permissions for Vault discovery
+        val permissions = if (android.os.Build.VERSION.SDK_INT >= 33) {
+            arrayOf(
+                android.Manifest.permission.READ_MEDIA_IMAGES,
+                android.Manifest.permission.READ_MEDIA_VIDEO
+            )
+        } else {
+            arrayOf(android.Manifest.permission.READ_EXTERNAL_STORAGE)
+        }
+        requestPermissionLauncher.launch(permissions)
+
         setContent {
             AerithTheme {
                 Surface(
@@ -48,11 +68,17 @@ fun AerithAppContent(
     val navController = androidx.navigation.compose.rememberNavController()
     val authState by authViewModel.uiState.collectAsState()
 
-    // Auto-navigate based on login state
-    LaunchedEffect(authState.isLoggedIn) {
+    // Auto-navigate based on login and onboarding state
+    LaunchedEffect(authState.isLoggedIn, authState.isOnboarding) {
         if (authState.isLoggedIn) {
-            navController.navigate(com.aerith.ui.navigation.Screen.Gallery.route) {
-                popUpTo(com.aerith.ui.navigation.Screen.Login.route) { inclusive = true }
+            if (authState.isOnboarding) {
+                navController.navigate(com.aerith.ui.navigation.Screen.Onboarding.route) {
+                    popUpTo(com.aerith.ui.navigation.Screen.Login.route) { inclusive = true }
+                }
+            } else {
+                navController.navigate(com.aerith.ui.navigation.Screen.Gallery.route) {
+                    popUpTo(0) { inclusive = true }
+                }
             }
         } else {
             navController.navigate(com.aerith.ui.navigation.Screen.Login.route) {
@@ -63,7 +89,11 @@ fun AerithAppContent(
 
     androidx.navigation.compose.NavHost(
         navController = navController,
-        startDestination = if (authState.isLoggedIn) com.aerith.ui.navigation.Screen.Gallery.route else com.aerith.ui.navigation.Screen.Login.route
+        startDestination = when {
+            authState.isLoggedIn && authState.isOnboarding -> com.aerith.ui.navigation.Screen.Onboarding.route
+            authState.isLoggedIn -> com.aerith.ui.navigation.Screen.Gallery.route
+            else -> com.aerith.ui.navigation.Screen.Login.route
+        }
     ) {
         composable(com.aerith.ui.navigation.Screen.Login.route) {
             LoginScreen(
@@ -72,6 +102,10 @@ fun AerithAppContent(
                 },
                 viewModel = authViewModel
             )
+        }
+
+        composable(com.aerith.ui.navigation.Screen.Onboarding.route) {
+            OnboardingScreen(authState = authState)
         }
         
         composable(com.aerith.ui.navigation.Screen.Gallery.route) {
@@ -110,6 +144,7 @@ fun AerithAppContent(
                 url = url,
                 authState = authState,
                 authViewModel = authViewModel,
+                onBack = { navController.popBackStack() },
                 galleryViewModel = galleryViewModel
             )
         }

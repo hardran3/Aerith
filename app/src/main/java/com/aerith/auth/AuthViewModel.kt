@@ -27,6 +27,7 @@ data class AuthState(
     val signerPackage: String? = null,
     val localBlossomUrl: String? = null,
     val fileMetadata: Map<String, List<List<String>>> = emptyMap(), // hash -> List of tags
+    val isOnboarding: Boolean = false,
     val isLoading: Boolean = false,
     val error: String? = null
 )
@@ -92,7 +93,7 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                 fileMetadata = metadata
             )
             // Still refresh data in background
-            fetchRelayList(cachedPubkey)
+            fetchRelayList(cachedPubkey, isInitial = false)
             checkLocalBlossom()
         }
     }
@@ -136,16 +137,17 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                 isLoggedIn = true,
                 pubkey = pubkey,
                 signerPackage = finalPackage,
+                isOnboarding = true,
                 isLoading = true
             )
-            fetchRelayList(pubkey)
+            fetchRelayList(pubkey, isInitial = true)
         } else {
             _uiState.value = _uiState.value.copy(error = "Login failed: No pubkey returned")
         }
     }
 
-    private fun fetchRelayList(pubkey: String) {
-        Log.d("AuthViewModel", "fetchRelayList called for: $pubkey")
+    private fun fetchRelayList(pubkey: String, isInitial: Boolean) {
+        Log.d("AuthViewModel", "fetchRelayList called for: $pubkey, isInitial: $isInitial")
         viewModelScope.launch(Dispatchers.IO) {
             Log.d("AuthViewModel", "Coroutine started. Thread: ${Thread.currentThread().name}")
             
@@ -188,10 +190,12 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
             
             withContext(Dispatchers.Main) {
                 if (relays.isEmpty() && _uiState.value.relays.isEmpty()) {
-                    _uiState.value = _uiState.value.copy(
-                        relays = emptyList(),
-                        error = "Failed to find Relay List (Kind 10002). \nDebug: $debugBuf"
-                    )
+                    if (!isInitial) {
+                        _uiState.value = _uiState.value.copy(
+                            relays = emptyList(),
+                            error = "Failed to find Relay List (Kind 10002). \nDebug: $debugBuf"
+                        )
+                    }
                 } else if (relays.isNotEmpty()) {
                      settingsRepository.saveRelays(relays)
                      _uiState.value = _uiState.value.copy(relays = relays)
@@ -202,14 +206,19 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
                 if (_uiState.value.relays.isNotEmpty()) _uiState.value.relays else defaultRelays
             } else relays
             
-            // 2. Fetch Blossom Servers
-            fetchBlossomServers(pubkey, relaysToUse)
+            // 2. Coordinated Fetches
+            val jobs = mutableListOf<kotlinx.coroutines.Job>()
             
-            // 3. Fetch User Profile (Kind 0)
-            fetchProfile(pubkey, relaysToUse)
-
-            // 4. Fetch File Metadata (Kind 1063)
-            fetchFileMetadata(pubkey, relaysToUse)
+            jobs.add(fetchBlossomServers(pubkey, relaysToUse))
+            jobs.add(fetchProfile(pubkey, relaysToUse))
+            jobs.add(fetchFileMetadata(pubkey, relaysToUse))
+            
+            if (isInitial) {
+                jobs.forEach { it.join() }
+                withContext(Dispatchers.Main) {
+                    _uiState.value = _uiState.value.copy(isOnboarding = false, isLoading = false)
+                }
+            }
         }
     }
 
@@ -231,8 +240,8 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         return (writeRelays + readRelays).distinct()
     }
 
-    private fun fetchBlossomServers(pubkey: String, relays: List<String>) {
-         viewModelScope.launch(Dispatchers.IO) {
+    private fun fetchBlossomServers(pubkey: String, relays: List<String>): kotlinx.coroutines.Job {
+         return viewModelScope.launch(Dispatchers.IO) {
              val indexers = listOf("wss://purplepag.es", "wss://user.kindpag.es")
              // Combine discovered relays (from Kind 10002) with indexers for best coverage
              val uniqueRelays = (relays + indexers + listOf("wss://relay.damus.io")).distinct()
@@ -301,8 +310,8 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
             .map { it[1] }
     }
 
-    private fun fetchProfile(pubkey: String, relays: List<String>) {
-        viewModelScope.launch(Dispatchers.IO) {
+    private fun fetchProfile(pubkey: String, relays: List<String>): kotlinx.coroutines.Job {
+        return viewModelScope.launch(Dispatchers.IO) {
             val indexers = listOf("wss://purplepag.es", "wss://relay.damus.io", "wss://relay.primal.net")
             val uniqueRelays = (relays + indexers).distinct().take(6)
              
@@ -338,8 +347,8 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun fetchFileMetadata(pubkey: String, relays: List<String>) {
-        viewModelScope.launch(Dispatchers.IO) {
+    private fun fetchFileMetadata(pubkey: String, relays: List<String>): kotlinx.coroutines.Job {
+        return viewModelScope.launch(Dispatchers.IO) {
             val uniqueRelays = (relays + listOf("wss://purplepag.es", "wss://relay.damus.io")).distinct().take(8)
             
             val deferred = uniqueRelays.map { url ->
@@ -441,4 +450,3 @@ class AuthViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 }
-

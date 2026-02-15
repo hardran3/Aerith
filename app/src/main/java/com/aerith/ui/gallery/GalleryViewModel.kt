@@ -6,6 +6,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.aerith.core.blossom.BlossomBlob
 import com.aerith.core.blossom.BlossomRepository
+import com.aerith.core.blossom.BlossomUploadResult
 import com.aerith.core.network.RelayClient
 import com.aerith.core.nostr.BlossomAuthHelper
 import kotlinx.coroutines.Dispatchers
@@ -20,7 +21,7 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-data class GalleryState(
+    data class GalleryState(
     val allBlobs: List<BlossomBlob> = emptyList(), // Source of truth
     val filteredBlobs: List<BlossomBlob> = emptyList(), // Displayed
     val trashBlobs: List<BlossomBlob> = emptyList(), // Locally known but not on servers
@@ -31,10 +32,8 @@ data class GalleryState(
     val selectedExtensions: Set<String> = emptySet(),
     val showImages: Boolean = true,
     val showVideos: Boolean = true,
-    val pinnedHashes: Set<String> = emptySet(),
-    val locallyCachedHashes: Set<String> = emptySet(),
-    val localServerUrl: String? = null,
-    val isServerBadgeEnabled: Boolean = true,
+    val vaultedHashes: Set<String> = emptySet(),
+    val locallyCachedHashes: Set<String> = emptySet(),    val localServerUrl: String? = null,
     val isFileTypeBadgeEnabled: Boolean = true,
     val lastAuthHeaders: Map<String, String> = emptyMap(),
     val fileMetadata: Map<String, List<List<String>>> = emptyMap(), // hash -> List of tags [["t", "tag"], ["name", "file"]]
@@ -42,6 +41,7 @@ data class GalleryState(
     val loadingMessage: String? = null,
     val error: String? = null,
     val localSyncProgress: String? = null,
+    val vaultSyncProgress: String? = null,
     
     // Track which servers are currently performing a mirror operation
     val serverMirroringStates: Map<String, Boolean> = emptyMap(),
@@ -57,7 +57,7 @@ data class GalleryState(
 class GalleryViewModel(application: Application) : AndroidViewModel(application) {
     private val repository = BlossomRepository(application)
     private val settingsRepository = com.aerith.core.data.SettingsRepository(application)
-    private val cacheManager = com.aerith.core.data.MediaCacheManager(application)
+    private val vaultManager = com.aerith.core.data.BlobVaultManager(application)
     private val _uiState = MutableStateFlow(GalleryState())
     val uiState: StateFlow<GalleryState> = _uiState.asStateFlow()
 
@@ -70,28 +70,83 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     private val listAdapter = moshi.adapter<List<BlossomBlob>>(
         com.squareup.moshi.Types.newParameterizedType(List::class.java, BlossomBlob::class.java)
     )
+    
+    private val mapAdapter = moshi.adapter(Map::class.java)
 
     init {
         // Load from cache
         loadFromCache()
-        refreshPinnedHashes()
+        scanVault() // New: Discover local files before servers
+        refreshVaultedHashes()
     }
 
-    private fun refreshPinnedHashes() {
-        val files = getApplication<Application>().filesDir.resolve("persistent_media").listFiles()
-        val hashes = files?.map { it.name }?.toSet() ?: emptySet()
-        val localHashes = settingsRepository.getLocallyCachedHashes()
-        _uiState.value = _uiState.value.copy(
-            pinnedHashes = hashes,
-            locallyCachedHashes = localHashes,
-            isServerBadgeEnabled = settingsRepository.isServerBadgeEnabled(),
-            isFileTypeBadgeEnabled = settingsRepository.isFileTypeBadgeEnabled()
-        )
+    /**
+     * Scans the local vault and adds any confirmed hashes to the registry.
+     * This handles the "Discovery after Reinstall" scenario.
+     */
+    private fun scanVault() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val vaultedHashes = vaultManager.getVaultedHashes()
+            if (vaultedHashes.isEmpty()) return@launch
+
+            val currentBlobs = _uiState.value.allBlobs
+            val currentHashes = currentBlobs.map { it.sha256 }.toSet()
+            
+            val newLocalBlobs = mutableListOf<BlossomBlob>()
+            
+            vaultedHashes.forEach { hash ->
+                if (hash !in currentHashes) {
+                    val file = vaultManager.getVaultFile(hash)
+                    if (file != null) {
+                        // Reconstruct basic blob info from file
+                        val ext = file.extension
+                        val mimeType = when(ext.lowercase()) {
+                            "jpg", "jpeg" -> "image/jpeg"
+                            "png" -> "image/png"
+                            "gif" -> "image/gif"
+                            "mp4" -> "video/mp4"
+                            else -> "application/octet-stream"
+                        }
+                        
+                        newLocalBlobs.add(BlossomBlob(
+                            url = file.toURI().toString(),
+                            sha256 = hash,
+                            size = file.length(),
+                            type = mimeType,
+                            serverUrl = "LOCAL_VAULT"
+                        ))
+                    }
+                }
+            }
+
+            if (newLocalBlobs.isNotEmpty()) {
+                withContext(Dispatchers.Main) {
+                    val updatedAll = (_uiState.value.allBlobs + newLocalBlobs).distinctBy { it.sha256 }
+                    _uiState.value = _uiState.value.copy(allBlobs = updatedAll)
+                    applyFilter()
+                    saveCache(updatedAll, _uiState.value.trashBlobs, _uiState.value.fileMetadata)
+                }
+            }
+        }
+    }
+
+    private fun refreshVaultedHashes() {
+        viewModelScope.launch(Dispatchers.IO) {
+            val vaulted = vaultManager.getVaultedHashes()
+            val localHashes = settingsRepository.getLocallyCachedHashes()
+            
+            withContext(Dispatchers.Main) {
+                _uiState.value = _uiState.value.copy(
+                    vaultedHashes = vaulted,
+                    locallyCachedHashes = localHashes,
+                    isFileTypeBadgeEnabled = settingsRepository.isFileTypeBadgeEnabled()
+                )
+            }
+        }
     }
 
     fun refreshDisplaySettings() {
         _uiState.value = _uiState.value.copy(
-            isServerBadgeEnabled = settingsRepository.isServerBadgeEnabled(),
             isFileTypeBadgeEnabled = settingsRepository.isFileTypeBadgeEnabled()
         )
     }
@@ -148,7 +203,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             fileMetadata = fileMetadata,
             locallyCachedHashes = localHashes,
             servers = uniqueServers,
-            isServerBadgeEnabled = settingsRepository.isServerBadgeEnabled(),
             isFileTypeBadgeEnabled = settingsRepository.isFileTypeBadgeEnabled()
         )
         applyFilter()
@@ -214,11 +268,12 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         
         currentLoadJob?.cancel()
         currentLoadJob = viewModelScope.launch {
-            // Only show full-screen loading if we have NO data yet
-            val showFullLoading = _uiState.value.allBlobs.isEmpty()
-            if (showFullLoading) {
+            // Only show full-screen loading if we have NO data in the registry yet
+            val isRegistryEmpty = _uiState.value.allBlobs.isEmpty()
+            if (isRegistryEmpty) {
                 _uiState.value = _uiState.value.copy(isLoading = true, error = null)
             } else {
+                // Silent refresh: clear error but keep current blobs visible
                 _uiState.value = _uiState.value.copy(error = null)
             }
 
@@ -242,36 +297,39 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 }
             }
             
-            val currentHashes = mediaBlobs.map { it.sha256 }.toSet()
+            // --- Registry-First Merge Logic ---
+            // 1. Current Registry (initialized from cache on startup)
+            val currentRegistry = _uiState.value.allBlobs.toMutableList()
             
-            // Trash logic
-            val newlyMissing = _uiState.value.allBlobs
-                .filter { it.sha256 !in currentHashes }
-                .map { it.copy(serverUrl = null) }
-            
-            newlyMissing.forEach { cacheManager.pinToPersistentStorage(it.sha256) }
-            
-            val combinedTrash = (_uiState.value.trashBlobs + newlyMissing)
-                .distinctBy { it.sha256 }
-                .filter { it.sha256 !in currentHashes }
-            
-            currentHashes.forEach { cacheManager.unpinFile(it) }
-            
-            val uniqueServers = (mediaBlobs.mapNotNull { it.serverUrl } + listOfNotNull(localBlossomUrl))
+            // 2. Upsert results from servers
+            mediaBlobs.forEach { incoming ->
+                val existingIndex = currentRegistry.indexOfFirst { it.sha256 == incoming.sha256 && it.serverUrl == incoming.serverUrl }
+                if (existingIndex != -1) {
+                    // Update existing record (confirmed still on server)
+                    currentRegistry[existingIndex] = incoming
+                } else {
+                    // New discovery (new server for hash, or entirely new hash)
+                    currentRegistry.add(incoming)
+                }
+            }
+
+            // 3. Deduplicate and Sort
+            val updatedRegistry = currentRegistry.distinctBy { it.sha256 + it.serverUrl }
+                .sortedByDescending { it.getCreationTime() ?: 0L }
+
+            val uniqueServers = (updatedRegistry.mapNotNull { it.serverUrl } + listOfNotNull(localBlossomUrl))
                 .filter { it.isNotEmpty() }
                 .distinct()
                 .sorted()
             
             // Check if anything actually changed
-            val hasChanged = _uiState.value.allBlobs != mediaBlobs || 
-                             _uiState.value.trashBlobs != combinedTrash ||
+            val hasChanged = _uiState.value.allBlobs != updatedRegistry || 
                              effectiveHeaders != _uiState.value.lastAuthHeaders ||
                              _uiState.value.isLoading
 
             if (hasChanged) {
                 _uiState.value = _uiState.value.copy(
-                    allBlobs = mediaBlobs,
-                    trashBlobs = combinedTrash,
+                    allBlobs = updatedRegistry,
                     fileMetadata = mergedMeta,
                     lastAuthHeaders = effectiveHeaders,
                     servers = uniqueServers,
@@ -279,16 +337,84 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                     isLoading = false
                 )
                 applyFilter()
-                saveCache(mediaBlobs, combinedTrash, mergedMeta)
-                refreshPinnedHashes()
-                prefetchImages(mediaBlobs)
+                saveCache(updatedRegistry, _uiState.value.trashBlobs, mergedMeta)
+                refreshVaultedHashes()
+                prefetchImages(updatedRegistry)
 
-                // --- Auto-mirror to Local Cache ---
+                // --- AUTO-VAULTING & LOCAL SYNC ---
+                syncToVault(updatedRegistry)
                 if (localBlossomUrl != null) {
-                    syncToLocalCache(mediaBlobs + combinedTrash, localBlossomUrl)
+                    syncToLocalCache(updatedRegistry + _uiState.value.trashBlobs, localBlossomUrl)
                 }
             } else {
                 _uiState.value = _uiState.value.copy(isLoading = false)
+            }
+        }
+    }
+
+    private fun syncToVault(blobs: List<BlossomBlob>) {
+        viewModelScope.launch(Dispatchers.IO) {
+            val uniqueBlobs = blobs.distinctBy { it.sha256 }
+            val vaultedSet = vaultManager.getVaultedHashes()
+            val toVault = uniqueBlobs.filter { it.sha256 !in vaultedSet }
+            if (toVault.isEmpty()) return@launch
+
+            val total = toVault.size
+            val completedCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+            withContext(Dispatchers.Main) {
+                _uiState.value = _uiState.value.copy(vaultSyncProgress = "Securing to Vault: 0 / $total")
+            }
+
+            android.util.Log.d("GalleryViewModel", "syncToVault: downloading ${toVault.size} blobs")
+            
+            // Limit concurrency strictly
+            val semaphore = kotlinx.coroutines.sync.Semaphore(2)
+            
+            coroutineScope {
+                toVault.forEach { blob ->
+                    launch {
+                        semaphore.withPermit {
+                            // 1. Try to vault from existing Coil cache first
+                            if (!vaultManager.contains(blob.sha256, vaultedSet)) {
+                                vaultManager.vaultFromCache(blob.sha256, blob.getExtension())
+                            }
+                            
+                            // 2. If still missing, download raw bytes and save to vault
+                            if (!vaultManager.contains(blob.sha256)) { 
+                                try {
+                                    val request = okhttp3.Request.Builder()
+                                        .url(blob.url)
+                                        .header("User-Agent", "Aerith/1.0")
+                                        .build()
+                                    
+                                    repository.client.newCall(request).execute().use { response ->
+                                        if (response.isSuccessful) {
+                                            val bytes = response.body?.bytes()
+                                            if (bytes != null) {
+                                                val tempFile = File.createTempFile("vault_download_", ".tmp", getApplication<Application>().cacheDir)
+                                                tempFile.writeBytes(bytes)
+                                                vaultManager.saveToVault(blob.sha256, blob.getExtension(), tempFile)
+                                                tempFile.delete()
+                                            }
+                                        }
+                                    }
+                                } catch (e: Exception) {
+                                    android.util.Log.e("GalleryViewModel", "Failed to auto-vault ${blob.sha256}", e)
+                                }
+                            }
+                        }
+                        val current = completedCount.incrementAndGet()
+                        withContext(Dispatchers.Main) {
+                            _uiState.value = _uiState.value.copy(vaultSyncProgress = "Securing to Vault: $current / $total")
+                        }
+                    }
+                }
+            }
+            // Final cleanup and refresh
+            withContext(Dispatchers.Main) {
+                _uiState.value = _uiState.value.copy(vaultSyncProgress = null)
+                refreshVaultedHashes()
             }
         }
     }
@@ -327,7 +453,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             }
             withContext(Dispatchers.Main) { 
                 _uiState.value = _uiState.value.copy(localSyncProgress = null)
-                refreshPinnedHashes() 
+                refreshVaultedHashes() 
             }
         }
     }
@@ -340,8 +466,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             blobs.filter { it.getMimeType()?.startsWith("image/") == true }.forEach { blob ->
                 val thumbRequest = coil.request.ImageRequest.Builder(context)
                     .data(blob.getThumbnailUrl())
-                    .diskCacheKey(blob.sha256)
-                    .memoryCacheKey(blob.sha256)
                     .size(400, 400)
                     .precision(coil.size.Precision.INEXACT)
                     .bitmapConfig(android.graphics.Bitmap.Config.RGB_565)
@@ -350,8 +474,6 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
 
                 val highResRequest = coil.request.ImageRequest.Builder(context)
                     .data(blob.url)
-                    .diskCacheKey(blob.sha256)
-                    .memoryCacheKey(blob.sha256)
                     .build()
                 imageLoader.enqueue(highResRequest)
             }
@@ -384,8 +506,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         if (_uiState.value.selectedServer == "TRASH") {
             applyFilter()
         }
-        cacheManager.clearAll()
-        refreshPinnedHashes()
+        vaultManager.clearAll()
+        refreshVaultedHashes()
         saveCache(_uiState.value.allBlobs, emptyList(), _uiState.value.fileMetadata)
     }
 
@@ -444,16 +566,25 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Returns a list of every unique tag currently used in the library (including Trash).
+     * Returns a list of every unique tag currently known across all files and metadata.
      */
     fun getAllUniqueTags(): List<String> {
         val state = _uiState.value
-        return (state.allBlobs + state.trashBlobs)
+        // Pull tags from ALL blobs in the registry and trash
+        val blobTags = (state.allBlobs + state.trashBlobs)
             .flatMap { it.getTags(state.fileMetadata) }
-            .distinct()
-            .sorted()
+        
+        // Also pull any tags from the metadata cache that might not have confirmed blobs
+        val orphanedTags = state.fileMetadata.values.flatMap { tagsList ->
+            tagsList.filter { it.firstOrNull() == "t" }.mapNotNull { it.getOrNull(1) }
+        }
+
+        return (blobTags + orphanedTags).distinct().sorted()
     }
 
+    /**
+     * Returns a list of every file extension known in the library.
+     */
     fun getAvailableExtensions(): List<String> {
         val state = _uiState.value
         return (state.allBlobs + state.trashBlobs)
@@ -588,7 +719,17 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(serverMirroringStates = _uiState.value.serverMirroringStates + (server to true))
             val authHeader = BlossomAuthHelper.encodeAuthHeader(signedEventJson)
-            val result = repository.mirrorBlob(server, sourceUrl, authHeader)
+            
+            val vaultFile = vaultManager.getVaultFile(originalBlob.sha256)
+            val result = if (vaultFile != null && vaultFile.exists()) {
+                // Actual UPLOAD from Vault
+                repository.uploadBytes(server, Uri.fromFile(vaultFile), originalBlob.getMimeType() ?: "application/octet-stream", authHeader, originalBlob.sha256)
+                    .map { uploadResult -> BlossomUploadResult(uploadResult.url, uploadResult.serverHash, server) }
+            } else {
+                // Fallback to MIRROR
+                repository.mirrorBlob(server, sourceUrl, authHeader)
+            }
+
             if (result.isSuccess) {
                 val uploadResult = result.getOrThrow()
                 val newBlob = originalBlob.copy(url = uploadResult.url, serverUrl = server)
@@ -598,7 +739,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 applyFilter()
                 saveCache(newAll, newTrash, _uiState.value.fileMetadata)
             } else {
-                _uiState.value = _uiState.value.copy(serverMirroringStates = _uiState.value.serverMirroringStates - server, error = "Mirror failed: ${result.exceptionOrNull()?.message}")
+                _uiState.value = _uiState.value.copy(serverMirroringStates = _uiState.value.serverMirroringStates - server, error = "Action failed: ${result.exceptionOrNull()?.message}")
             }
         }
     }
@@ -606,16 +747,29 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
     fun mirrorToLocalCache(hash: String, sourceUrl: String, originalBlob: BlossomBlob, localBlossomUrl: String) {
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(serverMirroringStates = _uiState.value.serverMirroringStates + (localBlossomUrl to true))
-            val result = repository.fetchToLocalCache(hash, sourceUrl, localBlossomUrl)
+            
+            val vaultFile = vaultManager.getVaultFile(hash)
+            val result = if (vaultFile != null && vaultFile.exists()) {
+                // Actual UPLOAD from Vault to Local Blossom
+                val authHeader = "" // Local typically doesn't need auth, or we can add it if needed
+                repository.uploadBytes(localBlossomUrl, Uri.fromFile(vaultFile), originalBlob.getMimeType() ?: "application/octet-stream", authHeader, hash)
+                    .map { uploadResult -> BlossomUploadResult(uploadResult.url, uploadResult.serverHash, localBlossomUrl) }
+            } else {
+                // Fallback to fetching
+                repository.fetchToLocalCache(hash, sourceUrl, localBlossomUrl)
+                    .map { unused -> BlossomUploadResult("$localBlossomUrl/$hash", hash, localBlossomUrl) }
+            }
+
             if (result.isSuccess) {
                 settingsRepository.addLocallyCachedHash(hash)
-                val newBlob = originalBlob.copy(url = "$localBlossomUrl/$hash", serverUrl = localBlossomUrl)
+                val uploadResult = result.getOrThrow()
+                val newBlob = originalBlob.copy(url = uploadResult.url, serverUrl = localBlossomUrl)
                 val newAll = (_uiState.value.allBlobs + newBlob).distinctBy { it.serverUrl + it.sha256 }
                 val newTrash = _uiState.value.trashBlobs.filter { it.sha256 != originalBlob.sha256 }
                 _uiState.value = _uiState.value.copy(allBlobs = newAll, trashBlobs = newTrash, serverMirroringStates = _uiState.value.serverMirroringStates - localBlossomUrl)
                 applyFilter()
                 saveCache(newAll, newTrash, _uiState.value.fileMetadata)
-                refreshPinnedHashes()
+                refreshVaultedHashes()
             } else {
                 _uiState.value = _uiState.value.copy(serverMirroringStates = _uiState.value.serverMirroringStates - localBlossomUrl, error = "Local cache sync failed: ${result.exceptionOrNull()?.message}")
             }
@@ -634,13 +788,31 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             var successCount = 0
             var failCount = 0
             val addedBlobs = mutableListOf<BlossomBlob>()
+            
+            val vaultFile = vaultManager.getVaultFile(blob.sha256)
+
             targetServers.forEach { server ->
                 val unsigned = BlossomAuthHelper.createUploadAuthEvent(pubkey, blob.sha256, blob.getSizeAsLong(), blob.getMimeType(), null, server)
                 val signed = if (signerPackage != null) signer.signEventBackground(signerPackage, unsigned, pubkey) else null
+                
                 if (signed != null) {
                     val authHeader = BlossomAuthHelper.encodeAuthHeader(signed)
-                    val result = repository.mirrorBlob(server, blob.url, authHeader)
-                    if (result.isSuccess) { successCount++; addedBlobs.add(blob.copy(url = result.getOrThrow().url, serverUrl = server)) } else { failCount++ }
+                    
+                    val result = if (vaultFile != null && vaultFile.exists()) {
+                        // ACTUAL UPLOAD
+                        repository.uploadBytes(server, Uri.fromFile(vaultFile), blob.getMimeType() ?: "application/octet-stream", authHeader, blob.sha256)
+                            .map { uploadResult -> BlossomUploadResult(uploadResult.url, uploadResult.serverHash, server) }
+                    } else {
+                        // Fallback to MIRROR
+                        repository.mirrorBlob(server, blob.url, authHeader)
+                    }
+
+                    if (result.isSuccess) { 
+                        successCount++
+                        addedBlobs.add(blob.copy(url = result.getOrThrow().url, serverUrl = server)) 
+                    } else { 
+                        failCount++ 
+                    }
                 } else { failCount++ }
                 _uiState.value = _uiState.value.copy(serverMirroringStates = _uiState.value.serverMirroringStates - server)
             }
@@ -651,7 +823,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 applyFilter()
                 saveCache(newAll, newTrash, _uiState.value.fileMetadata)
             }
-            if (failCount > 0) _uiState.value = _uiState.value.copy(error = "Mirrored to $successCount servers, $failCount failed.")
+            if (failCount > 0) _uiState.value = _uiState.value.copy(error = "Action completed: $successCount success, $failCount failed.")
         }
     }
 
@@ -689,14 +861,31 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                                 }
                             } else null
 
-                            // 2. Remote Server Mirrors (Parallel)
+                            // 2. Remote Server Mirrors/Uploads (Parallel)
                             targetServers.forEach { server ->
                                 if (server == localBlossomUrl) return@forEach
                                 launch {
-                                    val unsigned = BlossomAuthHelper.createUploadAuthEvent(pubkey, hash, originalBlob.getSizeAsLong(), originalBlob.getMimeType(), originalBlob.getName(_uiState.value.fileMetadata), server)
+                                    val vaultFile = vaultManager.getVaultFile(hash)
+                                    val unsigned = BlossomAuthHelper.createUploadAuthEvent(
+                                        pubkey, hash, originalBlob.getSizeAsLong(), 
+                                        originalBlob.getMimeType(), 
+                                        originalBlob.getName(_uiState.value.fileMetadata), 
+                                        server
+                                    )
                                     val signed = if (signerPackage != null) signer.signEventBackground(signerPackage, unsigned, pubkey) else null
+                                    
                                     if (signed != null) {
-                                        val result = repository.mirrorBlob(server, originalBlob.url, BlossomAuthHelper.encodeAuthHeader(signed))
+                                        val authHeader = BlossomAuthHelper.encodeAuthHeader(signed)
+                                        
+                                        val result = if (vaultFile != null && vaultFile.exists()) {
+                                            // ACTUAL UPLOAD from Vault
+                                            repository.uploadBytes(server, Uri.fromFile(vaultFile), originalBlob.getMimeType() ?: "application/octet-stream", authHeader, hash)
+                                                .map { uploadResult -> BlossomUploadResult(uploadResult.url, uploadResult.serverHash, server) } // Map to Result<BlossomUploadResult>
+                                        } else {
+                                            // Fallback to MIRROR if not in vault
+                                            repository.mirrorBlob(server, originalBlob.url, authHeader)
+                                        }
+
                                         if (result.isSuccess) {
                                             allAddedBlobs.add(originalBlob.copy(url = result.getOrThrow().url, serverUrl = server))
                                         }
@@ -783,7 +972,8 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             val newTrash = (_uiState.value.trashBlobs + fullyRemovedHashes.mapNotNull { hash ->
                 val representative = _uiState.value.allBlobs.find { it.sha256 == hash }
                 if (representative != null) {
-                    cacheManager.pinToPersistentStorage(hash)
+                    // Try to vault from cache if not already in vault
+                    vaultManager.vaultFromCache(hash, representative.getExtension())
                     representative.copy(serverUrl = null)
                 } else null
             }).distinctBy { it.sha256 }
@@ -797,7 +987,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
             )
             applyFilter()
             saveCache(newAllBlobs, newTrash, _uiState.value.fileMetadata)
-            refreshPinnedHashes()
+            refreshVaultedHashes()
         }
     }
 
@@ -864,7 +1054,7 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                 val server = blob.serverUrl
                 if (server != null) {
                     launch {
-                        val unsignedMirror = BlossomAuthHelper.createUploadAuthEvent(
+                        val unsignedMirrorString = BlossomAuthHelper.createUploadAuthEvent(
                             pubkey = pubkey,
                             sha256 = blob.sha256,
                             size = blob.getSizeAsLong(),
@@ -873,18 +1063,24 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                             serverUrl = server
                         )
                         
-                        val mirrorEventObj = JSONObject(unsignedMirror)
-                        val tagsArr = mirrorEventObj.getJSONArray("tags")
-                        newTags.forEach { tag ->
-                            tagsArr.put(JSONArray().put("t").put(tag))
-                        }
-                        
-                        val signedMirror = if (signerPackage != null) {
-                            signer.signEventBackground(signerPackage, mirrorEventObj.toString(), pubkey)
-                        } else null
+                        // Add tags using Moshi instead of JSONObject to avoid escaping slashes
+                        val mirrorEventMap = (mapAdapter.fromJson(unsignedMirrorString) as? Map<String, Any>)?.toMutableMap()
+                        if (mirrorEventMap != null) {
+                            val existingTags = (mirrorEventMap["tags"] as? List<*>) ?: emptyList<Any>()
+                            val tagsList = existingTags.toMutableList()
+                            newTags.forEach { tag ->
+                                tagsList.add(listOf("t", tag))
+                            }
+                            mirrorEventMap["tags"] = tagsList
+                            
+                            val finalMirrorJson = mapAdapter.toJson(mirrorEventMap)
+                            val signedMirror = if (signerPackage != null) {
+                                signer.signEventBackground(signerPackage, finalMirrorJson, pubkey)
+                            } else null
 
-                        if (signedMirror != null) {
-                            repository.mirrorBlob(server, blob.url, BlossomAuthHelper.encodeAuthHeader(signedMirror))
+                            if (signedMirror != null) {
+                                repository.mirrorBlob(server, blob.url, BlossomAuthHelper.encodeAuthHeader(signedMirror))
+                            }
                         }
                     }
                 }
@@ -950,16 +1146,25 @@ class GalleryViewModel(application: Application) : AndroidViewModel(application)
                                     // 3. Mirror to server
                                     val server = blob.serverUrl
                                     if (server != null) {
-                                        val unsignedMirror = BlossomAuthHelper.createUploadAuthEvent(
+                                        val unsignedMirrorString = BlossomAuthHelper.createUploadAuthEvent(
                                             pubkey, hash, blob.getSizeAsLong(), blob.getMimeType(), blob.getName(_uiState.value.fileMetadata), server
                                         )
-                                        val mirrorEventObj = JSONObject(unsignedMirror)
-                                        val tagsArr = mirrorEventObj.getJSONArray("tags")
-                                        combinedLabels.forEach { tag -> tagsArr.put(JSONArray().put("t").put(tag)) }
                                         
-                                        val signedMirror = signer.signEventBackground(signerPackage!!, mirrorEventObj.toString(), pubkey)
-                                        if (signedMirror != null) {
-                                            repository.mirrorBlob(server, blob.url, BlossomAuthHelper.encodeAuthHeader(signedMirror))
+                                        // Add tags using Moshi instead of JSONObject to avoid escaping slashes
+                                        val mirrorEventMap = (mapAdapter.fromJson(unsignedMirrorString) as? Map<String, Any>)?.toMutableMap()
+                                        if (mirrorEventMap != null) {
+                                            val existingTags = (mirrorEventMap["tags"] as? List<*>) ?: emptyList<Any>()
+                                            val tagsList = existingTags.toMutableList()
+                                            combinedLabels.forEach { tag ->
+                                                tagsList.add(listOf("t", tag))
+                                            }
+                                            mirrorEventMap["tags"] = tagsList
+                                            
+                                            val finalMirrorJson = mapAdapter.toJson(mirrorEventMap)
+                                            val signedMirror = signer.signEventBackground(signerPackage!!, finalMirrorJson, pubkey)
+                                            if (signedMirror != null) {
+                                                repository.mirrorBlob(server, blob.url, BlossomAuthHelper.encodeAuthHeader(signedMirror))
+                                            }
                                         }
                                     }
                                 }

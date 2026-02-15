@@ -65,8 +65,7 @@ fun GalleryScreen(
     var showBulkLabelDialog by remember { mutableStateOf(false) }
     var showBulkDeleteServerDialog by remember { mutableStateOf(false) }
     var showBulkMirrorDialog by remember { mutableStateOf(false) }
-    var showFilterSheet by remember { mutableStateOf(false) }
-    val filterSheetState = rememberModalBottomSheetState()
+    var isFilterExpanded by remember { mutableStateOf(false) }
     var bulkTagsInput by remember { mutableStateOf("") }
 
     // Track if we've performed the initial refresh this session
@@ -454,7 +453,16 @@ fun GalleryScreen(
     }
 
     if (showBulkDeleteServerDialog) {
-        val selectedServers = remember { mutableStateListOf<String>().apply { addAll(authState.blossomServers) } }
+        val selectedServers = remember { 
+            mutableStateListOf<String>().apply { 
+                val current = state.selectedServer
+                if (current != null && current != "TRASH") {
+                    add(current)
+                } else {
+                    addAll(authState.blossomServers)
+                }
+            } 
+        }
 
         AlertDialog(
             onDismissRequest = { showBulkDeleteServerDialog = false },
@@ -553,44 +561,6 @@ fun GalleryScreen(
                 }
             }
         )
-    }
-
-    if (showFilterSheet) {
-        ModalBottomSheet(
-            onDismissRequest = { showFilterSheet = false },
-            sheetState = filterSheetState
-        ) {
-            Column(modifier = Modifier.padding(16.dp).padding(bottom = 32.dp)) {
-                Text("Filter Media", style = MaterialTheme.typography.headlineSmall)
-                Spacer(modifier = Modifier.height(16.dp))
-                
-                Text("Media Type", style = MaterialTheme.typography.titleMedium)
-                Row(verticalAlignment = Alignment.CenterVertically) {
-                    Checkbox(checked = state.showImages, onCheckedChange = { galleryViewModel.toggleShowImages() })
-                    Text("Show Images")
-                    Spacer(modifier = Modifier.width(16.dp))
-                    Checkbox(checked = state.showVideos, onCheckedChange = { galleryViewModel.toggleShowVideos() })
-                    Text("Show Videos")
-                }
-                
-                HorizontalDivider(modifier = Modifier.padding(vertical = 16.dp))
-                
-                Text("File Types", style = MaterialTheme.typography.titleMedium)
-                Spacer(modifier = Modifier.height(8.dp))
-                FlowRow(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    galleryViewModel.getAvailableExtensions().forEach { ext ->
-                        FilterChip(
-                            selected = state.selectedExtensions.contains(ext),
-                            onClick = { galleryViewModel.toggleExtension(ext) },
-                            label = { Text(ext.uppercase()) }
-                        )
-                    }
-                }
-            }
-        }
     }
 
     Scaffold(
@@ -752,10 +722,15 @@ fun GalleryScreen(
             }
         }
 
+        // Full unfiltered set for the Expanded Filter Panel and Labeling dialogs
+        val (fullLibraryTags, fullLibraryExtensions) = remember(state.allBlobs, state.trashBlobs, state.fileMetadata) {
+            galleryViewModel.getAllUniqueTags() to galleryViewModel.getAvailableExtensions()
+        }
+
         Column(modifier = Modifier.fillMaxSize().padding(padding)) {
             // Background update/upload/mirror indicator
-            val isBusy = uploadState.isUploading || state.isLoading || state.localSyncProgress != null
-            val progressText = uploadState.progress ?: state.loadingMessage ?: state.localSyncProgress
+            val isBusy = uploadState.isUploading || state.isLoading || state.localSyncProgress != null || state.vaultSyncProgress != null
+            val progressText = uploadState.progress ?: state.loadingMessage ?: state.localSyncProgress ?: state.vaultSyncProgress
 
             if (isBusy) {
                 Column(modifier = Modifier.fillMaxWidth()) {
@@ -780,132 +755,271 @@ fun GalleryScreen(
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 IconButton(
-                    onClick = { showFilterSheet = true },
+                    onClick = { isFilterExpanded = !isFilterExpanded },
                     modifier = Modifier.padding(start = 8.dp)
                 ) {
-                    Icon(Icons.Default.FilterList, "Filter Options", tint = MaterialTheme.colorScheme.primary)
+                    Icon(
+                        imageVector = if (isFilterExpanded) Icons.Default.Close else Icons.Default.FilterList, 
+                        contentDescription = "Filter Options", 
+                        tint = MaterialTheme.colorScheme.primary
+                    )
                 }
 
-                if (allTags.isNotEmpty()) {
-                    ScrollableTabRow(
-                        selectedTabIndex = -1,
-                        edgePadding = 8.dp,
-                        containerColor = Color.Transparent,
-                        modifier = Modifier.weight(1f),
-                        divider = {},
-                        indicator = {}
-                    ) {
-                        allTags.forEach { (tag, count) ->
-                            val isSelected = state.selectedTags.contains(tag)
-                            FilterChip(
-                                selected = isSelected,
-                                onClick = { galleryViewModel.toggleTag(tag) },
-                                label = { 
-                                    Text(
-                                        text = if (count > 0) "$tag $count" else tag,
-                                        style = MaterialTheme.typography.labelSmall,
-                                        fontSize = 11.sp
-                                    ) 
-                                },
-                                modifier = Modifier.padding(horizontal = 4.dp),
-                                leadingIcon = if (isSelected) {
-                                    { Icon(Icons.Default.Check, null, modifier = Modifier.size(14.dp)) }
-                                } else null
-                            )
+                if (!isFilterExpanded) {
+                    if (allTags.isNotEmpty()) {
+                        ScrollableTabRow(
+                            selectedTabIndex = -1,
+                            edgePadding = 8.dp,
+                            containerColor = Color.Transparent,
+                            modifier = Modifier.weight(1f),
+                            divider = {},
+                            indicator = {}
+                        ) {
+                            allTags.forEach { (tag, count) ->
+                                val isSelected = state.selectedTags.contains(tag)
+                                FilterChip(
+                                    selected = isSelected,
+                                    onClick = { galleryViewModel.toggleTag(tag) },
+                                    label = { 
+                                        Text(
+                                            text = if (count > 0) "$tag $count" else tag,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontSize = 11.sp
+                                        ) 
+                                    },
+                                    modifier = Modifier.padding(horizontal = 4.dp),
+                                    leadingIcon = if (isSelected) {
+                                        { Icon(Icons.Default.Check, null, modifier = Modifier.size(14.dp)) }
+                                    } else null
+                                )
+                            }
+                        }
+                    } else {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                    
+                    if (state.selectedTags.isNotEmpty()) {
+                        TextButton(
+                            onClick = { galleryViewModel.clearTags() },
+                            modifier = Modifier.padding(end = 8.dp)
+                        ) {
+                            Text("Clear")
                         }
                     }
                 } else {
+                    Text(
+                        text = "Filters",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.padding(start = 8.dp)
+                    )
                     Spacer(modifier = Modifier.weight(1f))
-                }
-                
-                if (state.selectedTags.isNotEmpty()) {
-                    TextButton(
-                        onClick = { galleryViewModel.clearTags() },
-                        modifier = Modifier.padding(end = 8.dp)
-                    ) {
-                        Text("Clear")
+                    if (state.selectedTags.isNotEmpty() || state.selectedExtensions.isNotEmpty()) {
+                        TextButton(
+                            onClick = { 
+                                galleryViewModel.clearTags()
+                                state.selectedExtensions.forEach { galleryViewModel.toggleExtension(it) }
+                            },
+                            modifier = Modifier.padding(end = 8.dp)
+                        ) {
+                            Text("Reset All")
+                        }
                     }
                 }
             }
 
             Box(modifier = Modifier.weight(1f)) {
-                // Initial load or background refresh when empty
-                val isInitialLoad = !hasAutoRefreshed || (state.isLoading && state.allBlobs.isEmpty())
-                
-                if (isInitialLoad && !uploadState.isUploading) {
-                    Column(
-                        modifier = Modifier.fillMaxSize(),
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center
-                    ) {
-                        CircularProgressIndicator()
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            text = "Blossom Servers Loading...",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                } else if (state.error != null) {
-                    Text(
-                        text = "Gallery Error: ${state.error}",
-                        color = MaterialTheme.colorScheme.error,
-                        modifier = Modifier.align(Alignment.Center).padding(16.dp)
-                    )
-                } else if (state.filteredBlobs.isEmpty()) {
-                    Text(
-                        text = if (state.selectedServer == "TRASH") "Trash is empty." else "No media found.",
-                        modifier = Modifier.align(Alignment.Center)
-                    )
-                } else {
-                    LazyVerticalGrid(
-                        columns = GridCells.Adaptive(minSize = 120.dp),
-                        contentPadding = PaddingValues(1.dp),
-                        horizontalArrangement = Arrangement.spacedBy(1.dp),
-                        verticalArrangement = Arrangement.spacedBy(1.dp),
-                        modifier = Modifier.fillMaxSize()
-                    ) {
-                        items(
-                            items = state.filteredBlobs,
-                            key = { it.sha256 } // Stable keys for high-performance scrolling
-                        ) { blob ->
-                            val isSelected = state.selectedHashes.contains(blob.sha256)
-                            val isPinned = state.pinnedHashes.contains(blob.sha256)
-                            val isLocallyCached = state.locallyCachedHashes.contains(blob.sha256)
-                            val serverCount = remember(state.allBlobs, blob.sha256, isLocallyCached) {
-                                val remoteCount = state.allBlobs.filter { it.sha256 == blob.sha256 }.mapNotNull { it.serverUrl }.distinct().size
-                                if (isLocallyCached) remoteCount + 1 else remoteCount
-                            }
-                            val isDiscovered = remember(state.allBlobs, blob.sha256) {
-                                state.allBlobs.none { it.sha256 == blob.sha256 }
-                            }
-                            val hasMetadata = remember(state.fileMetadata, blob.sha256) {
-                                state.fileMetadata.containsKey(blob.sha256.lowercase())
-                            }
-
-                            MediaItem(
-                                blob = blob,
-                                isSelected = isSelected,
-                                inSelectionMode = isSelectionMode,
-                                isPinned = isPinned,
-                                isLocallyCached = isLocallyCached,
-                                localUrl = authState.localBlossomUrl,
-                                serverCount = serverCount,
-                                isDiscovered = isDiscovered,
-                                hasMetadata = hasMetadata,
-                                isServerBadgeEnabled = state.isServerBadgeEnabled,
-                                isFileTypeBadgeEnabled = state.isFileTypeBadgeEnabled,
-                                onClick = { 
-                                    if (isSelectionMode) {
-                                        galleryViewModel.toggleSelection(blob.sha256)
-                                    } else {
-                                        onMediaClick(blob.url) 
+                Column(modifier = Modifier.fillMaxSize()) {
+                    if (isFilterExpanded) {
+                        Surface(
+                            tonalElevation = 2.dp,
+                            shadowElevation = 4.dp,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .heightIn(max = 500.dp) // Cap height to keep some grid visible
+                        ) {
+                            Column {
+                                // 1. Scrollable Tag Area
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f, fill = false)
+                                        .padding(horizontal = 16.dp)
+                                ) {
+                                    Column(modifier = Modifier.verticalScroll(rememberScrollState())) {
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        Text(
+                                            "Tags",
+                                            style = MaterialTheme.typography.titleSmall,
+                                            color = MaterialTheme.colorScheme.primary
+                                        )
+                                        Spacer(modifier = Modifier.height(8.dp))
+                                        FlowRow(
+                                            modifier = Modifier.fillMaxWidth(),
+                                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                        ) {
+                                            fullLibraryTags.forEach { tag ->
+                                                val isSelected = state.selectedTags.contains(tag)
+                                                // Get count from the filtered counts map
+                                                val count = allTags.find { it.first == tag }?.second ?: 0
+                                                
+                                                FilterChip(
+                                                    selected = isSelected,
+                                                    onClick = { galleryViewModel.toggleTag(tag) },
+                                                    label = {
+                                                        Text(text = if (count > 0) "$tag $count" else tag)
+                                                    },
+                                                    leadingIcon = if (isSelected) {
+                                                        {
+                                                            Icon(
+                                                                Icons.Default.Check,
+                                                                null,
+                                                                modifier = Modifier.size(14.dp)
+                                                            )
+                                                        }
+                                                    } else null
+                                                )
+                                            }
+                                        }
+                                        Spacer(modifier = Modifier.height(16.dp))
                                     }
-                                },
-                                onLongClick = {
-                                    galleryViewModel.toggleSelection(blob.sha256)
                                 }
+
+                                // 2. Fixed Footer
+                                Column(
+                                    modifier = Modifier
+                                        .background(MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f))
+                                        .padding(16.dp)
+                                ) {
+                                    Text("Media Type", style = MaterialTheme.typography.titleSmall)
+                                    Row(verticalAlignment = Alignment.CenterVertically) {
+                                        FilterChip(
+                                            selected = state.showImages,
+                                            onClick = { galleryViewModel.toggleShowImages() },
+                                            label = { Text("Images") },
+                                            leadingIcon = if (state.showImages) {
+                                                { Icon(Icons.Default.Check, null, modifier = Modifier.size(14.dp)) }
+                                            } else null
+                                        )
+                                        Spacer(modifier = Modifier.width(8.dp))
+                                        FilterChip(
+                                            selected = state.showVideos,
+                                            onClick = { galleryViewModel.toggleShowVideos() },
+                                            label = { Text("Videos") },
+                                            leadingIcon = if (state.showVideos) {
+                                                { Icon(Icons.Default.Check, null, modifier = Modifier.size(14.dp)) }
+                                            } else null
+                                        )
+                                    }
+
+                                    Spacer(modifier = Modifier.height(12.dp))
+
+                                    Text("File Types", style = MaterialTheme.typography.titleSmall)
+                                    FlowRow(
+                                        modifier = Modifier.fillMaxWidth(),
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        fullLibraryExtensions.forEach { ext ->
+                                            FilterChip(
+                                                selected = state.selectedExtensions.contains(ext),
+                                                onClick = { galleryViewModel.toggleExtension(ext) },
+                                                label = { Text(ext.uppercase()) },
+                                                leadingIcon = if (state.selectedExtensions.contains(ext)) {
+                                                    { Icon(Icons.Default.Check, null, modifier = Modifier.size(14.dp)) }
+                                                } else null
+                                            )
+                                        }
+                                    }
+
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Button(
+                                        onClick = { isFilterExpanded = false },
+                                        modifier = Modifier.fillMaxWidth()
+                                    ) {
+                                        Text("Show Results")
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // --- Gallery Grid ---
+                    Box(modifier = Modifier.weight(1f)) {
+                        // Initial load or background refresh when empty
+                        val showFullLoading = state.isLoading && state.allBlobs.isEmpty()
+
+                        if (showFullLoading && !uploadState.isUploading) {
+                            Column(
+                                modifier = Modifier.fillMaxSize(),
+                                horizontalAlignment = Alignment.CenterHorizontally,
+                                verticalArrangement = Arrangement.Center
+                            ) {
+                                CircularProgressIndicator()
+                                Spacer(modifier = Modifier.height(16.dp))
+                                Text(
+                                    text = "Blossom Servers Loading...",
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        } else if (state.error != null) {
+                            Text(
+                                text = "Gallery Error: ${state.error}",
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.align(Alignment.Center).padding(16.dp)
                             )
+                        } else if (state.filteredBlobs.isEmpty()) {
+                            Text(
+                                text = if (state.selectedServer == "TRASH") "Trash is empty." else "No media found.",
+                                modifier = Modifier.align(Alignment.Center)
+                            )
+                        } else {
+                            LazyVerticalGrid(
+                                columns = GridCells.Adaptive(minSize = 120.dp),
+                                contentPadding = PaddingValues(1.dp),
+                                horizontalArrangement = Arrangement.spacedBy(1.dp),
+                                verticalArrangement = Arrangement.spacedBy(1.dp),
+                                modifier = Modifier.fillMaxSize()
+                            ) {
+                                items(
+                                    items = state.filteredBlobs,
+                                    key = { it.sha256 } // Stable keys for high-performance scrolling
+                                ) { blob ->
+                                    val isSelected = state.selectedHashes.contains(blob.sha256)
+                                    val isVaulted = state.vaultedHashes.contains(blob.sha256)
+                                    val isLocallyCached = state.locallyCachedHashes.contains(blob.sha256)
+                                    val serverCount = remember(state.allBlobs, blob.sha256, isLocallyCached) {
+                                        val remoteCount = state.allBlobs.filter { it.sha256 == blob.sha256 }.mapNotNull { it.serverUrl }.distinct().size
+                                        if (isLocallyCached) remoteCount + 1 else remoteCount
+                                    }
+                                    val isDiscovered = remember(state.allBlobs, blob.sha256) {
+                                        state.allBlobs.none { it.sha256 == blob.sha256 }
+                                    }
+                                    val hasMetadata = remember(state.fileMetadata, blob.sha256) {
+                                        state.fileMetadata.containsKey(blob.sha256.lowercase())
+                                    }
+
+                                    MediaItem(
+                                        blob = blob,
+                                        isSelected = isSelected,
+                                        inSelectionMode = isSelectionMode,
+                                        isVaulted = isVaulted,
+                                        isLocallyCached = isLocallyCached,
+                                        localUrl = authState.localBlossomUrl,
+                                        isDiscovered = isDiscovered,
+                                        hasMetadata = hasMetadata,
+                                        isFileTypeBadgeEnabled = state.isFileTypeBadgeEnabled,
+                                        onClick = { 
+                                            if (isSelectionMode) {
+                                                galleryViewModel.toggleSelection(blob.sha256)
+                                            } else {
+                                                onMediaClick(blob.url) 
+                                            }
+                                        },
+                                        onLongClick = {
+                                            galleryViewModel.toggleSelection(blob.sha256)
+                                        }
+                                    )
+                                }
+                            }
                         }
                     }
                 }
@@ -920,13 +1034,11 @@ fun MediaItem(
     blob: BlossomBlob, 
     isSelected: Boolean,
     inSelectionMode: Boolean,
-    isPinned: Boolean,
+    isVaulted: Boolean,
     isLocallyCached: Boolean,
     localUrl: String?,
-    serverCount: Int,
     isDiscovered: Boolean = false,
     hasMetadata: Boolean = false,
-    isServerBadgeEnabled: Boolean,
     isFileTypeBadgeEnabled: Boolean,
     onClick: () -> Unit,
     onLongClick: () -> Unit
@@ -938,18 +1050,17 @@ fun MediaItem(
         blob.getMimeType()?.substringAfterLast("/")?.substringBefore(";")?.uppercase() ?: "???"
     }
     val context = LocalContext.current
+    val vaultManager = remember { com.aerith.core.data.BlobVaultManager(context) }
     
-    val imageRequest = remember(blob.sha256, blob.url, isPinned, isLocallyCached) {
+    val imageRequest = remember(blob.sha256, blob.url, isVaulted, isLocallyCached) {
         val model = when {
-            isPinned -> java.io.File(context.filesDir, "persistent_media/${blob.sha256}")
+            isVaulted -> vaultManager.getVaultFile(blob.sha256)
             isLocallyCached && localUrl != null -> "$localUrl/${blob.sha256}"
             else -> blob.getThumbnailUrl()
         }
 
         coil.request.ImageRequest.Builder(context)
             .data(model)
-            .diskCacheKey(blob.sha256)
-            .memoryCacheKey(blob.sha256)
             .size(400, 400)
             .precision(coil.size.Precision.INEXACT)
             .bitmapConfig(android.graphics.Bitmap.Config.RGB_565)
@@ -975,33 +1086,7 @@ fun MediaItem(
 
         // --- Badges ---
         
-        // 1. Top Left: Server Count (Circular)
-        if (isServerBadgeEnabled && serverCount > 0) {
-            Box(
-                modifier = Modifier
-                    .padding(4.dp)
-                    .align(Alignment.TopStart)
-                    .size(20.dp)
-                    .background(
-                        color = when {
-                            hasMetadata -> Color(0xFFE1BEE7) // Light Purple for 1063
-                            isLocallyCached -> Color(0xFFC8E6C9) // Green for Cached
-                            else -> Color.White
-                        }, 
-                        shape = CircleShape
-                    ),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = serverCount.toString(),
-                    style = MaterialTheme.typography.labelSmall,
-                    color = Color.Black,
-                    fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
-                )
-            }
-        }
-
-        // 2. Top Right: Discovery Badge
+        // 1. Top Right: Discovery Badge
         if (isDiscovered) {
             Box(
                 modifier = Modifier

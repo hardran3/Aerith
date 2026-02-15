@@ -1,8 +1,8 @@
 package com.aerith.core.nostr
 
 import android.util.Base64
-import org.json.JSONArray
-import org.json.JSONObject
+import com.squareup.moshi.Moshi
+import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import java.nio.charset.StandardCharsets
 
 /**
@@ -14,37 +14,37 @@ import java.nio.charset.StandardCharsets
  */
 object BlossomAuthHelper {
 
+    private val moshi = Moshi.Builder().add(KotlinJsonAdapterFactory()).build()
+    private val mapAdapter = moshi.adapter(Map::class.java)
+
     /**
      * Creates an unsigned Kind 24242 auth event for a DELETE operation.
-     *
-     * @param pubkey The user's public key (hex).
-     * @param sha256 The SHA-256 hash of the blob to delete.
-     * @param serverUrl The URL of the server receiving the request.
-     * @return A JSON string of the unsigned Nostr event.
      */
     fun createDeleteAuthEvent(pubkey: String, sha256: String, serverUrl: String? = null): String {
-        val tags = JSONArray()
         val now = System.currentTimeMillis() / 1000
         val expiration = now + 3600 // 1 hour
 
         // Tag order for delete: t, expiration, x, p, server
-        tags.put(JSONArray().put("t").put("delete"))
-        tags.put(JSONArray().put("expiration").put(expiration.toString()))
-        tags.put(JSONArray().put("x").put(sha256))
-        tags.put(JSONArray().put("p").put(pubkey))
+        val tags = mutableListOf(
+            listOf("t", "delete"),
+            listOf("expiration", expiration.toString()),
+            listOf("x", sha256),
+            listOf("p", pubkey)
+        )
         
         if (serverUrl != null) {
-            tags.put(JSONArray().put("server").put(serverUrl.removeSuffix("/")))
+            tags.add(listOf("server", serverUrl.removeSuffix("/")))
         }
 
-        val event = JSONObject()
-        event.put("kind", 24242)
-        event.put("content", "Deleting $sha256")
-        event.put("pubkey", pubkey)
-        event.put("created_at", now - 5) // 5s buffer for clock drift
-        event.put("tags", tags)
+        val event = mutableMapOf<String, Any>(
+            "kind" to 24242,
+            "content" to "Deleting $sha256",
+            "pubkey" to pubkey,
+            "created_at" to now - 5,
+            "tags" to tags
+        )
 
-        return event.toString()
+        return mapAdapter.toJson(event)
     }
 
     fun createUploadAuthEvent(
@@ -55,53 +55,56 @@ object BlossomAuthHelper {
         fileName: String?,
         serverUrl: String? = null
     ): String {
-        val tags = JSONArray()
         val now = System.currentTimeMillis() / 1000
         val expiration = now + 3600 // 1 hour
 
         // ┌───────────────────────────────────────────────────────┐
         // │ TAG ORDER MATTERS: t → expiration → size → x         │
-        // │ Some servers (Go/Rust parsers) are order-sensitive.   │
         // └───────────────────────────────────────────────────────┘
-        tags.put(JSONArray().put("t").put("upload"))
-        tags.put(JSONArray().put("expiration").put(expiration.toString()))
-        tags.put(JSONArray().put("size").put(size.toString()))
-        tags.put(JSONArray().put("x").put(sha256))
+        val tags = mutableListOf(
+            listOf("t", "upload"),
+            listOf("expiration", expiration.toString()),
+            listOf("size", size.toString()),
+            listOf("x", sha256)
+        )
 
         // Optional tags
-        if (serverUrl != null) tags.put(JSONArray().put("server").put(serverUrl.removeSuffix("/")))
-        if (fileName != null) tags.put(JSONArray().put("name").put(fileName))
-        if (mimeType != null) tags.put(JSONArray().put("type").put(mimeType))
+        if (serverUrl != null) tags.add(listOf("server", serverUrl.removeSuffix("/")))
+        if (fileName != null) tags.add(listOf("name", fileName))
+        if (mimeType != null) tags.add(listOf("type", mimeType))
 
-        val event = JSONObject()
-        event.put("kind", 24242)
+        val event = mutableMapOf<String, Any>(
+            "kind" to 24242
+        )
         val displayFileName = fileName ?: sha256.take(8)
-        event.put("content", "Uploading $displayFileName")
-        event.put("pubkey", pubkey)
-        event.put("created_at", now - 5)
-        event.put("tags", tags)
+        event["content"] = "Uploading $displayFileName"
+        event["pubkey"] = pubkey
+        event["created_at"] = now - 5
+        event["tags"] = tags
 
-        return event.toString()
+        return mapAdapter.toJson(event)
     }
 
     fun createListAuthEvent(pubkey: String, serverUrl: String): String {
-        val tags = JSONArray()
         val now = System.currentTimeMillis() / 1000
         val expiration = now + 3600 // 1 hour
 
         // Order: t, expiration, server
-        tags.put(JSONArray().put("t").put("list"))
-        tags.put(JSONArray().put("expiration").put(expiration.toString()))
-        tags.put(JSONArray().put("server").put(serverUrl.removeSuffix("/")))
+        val tags = listOf(
+            listOf("t", "list"),
+            listOf("expiration", expiration.toString()),
+            listOf("server", serverUrl.removeSuffix("/"))
+        )
         
-        val event = JSONObject()
-        event.put("kind", 24242)
-        event.put("content", "")
-        event.put("pubkey", pubkey)
-        event.put("created_at", now - 5)
-        event.put("tags", tags)
+        val event = mutableMapOf<String, Any>(
+            "kind" to 24242,
+            "content" to "",
+            "pubkey" to pubkey,
+            "created_at" to now - 5,
+            "tags" to tags
+        )
 
-        return event.toString()
+        return mapAdapter.toJson(event)
     }
 
     /**
@@ -118,30 +121,32 @@ object BlossomAuthHelper {
         summary: String? = null,
         fallbacks: List<String> = emptyList()
     ): String {
-        val eventTags = JSONArray()
-        eventTags.put(JSONArray().put("x").put(sha256))
-        eventTags.put(JSONArray().put("url").put(url))
-        if (mimeType != null) eventTags.put(JSONArray().put("m").put(mimeType))
-        if (name != null) eventTags.put(JSONArray().put("name").put(name))
-        if (alt != null) eventTags.put(JSONArray().put("alt").put(alt))
-        if (summary != null) eventTags.put(JSONArray().put("summary").put(summary))
+        val eventTags = mutableListOf(
+            listOf("x", sha256),
+            listOf("url", url)
+        )
+        if (mimeType != null) eventTags.add(listOf("m", mimeType))
+        if (name != null) eventTags.add(listOf("name", name))
+        if (alt != null) eventTags.add(listOf("alt", alt))
+        if (summary != null) eventTags.add(listOf("summary", summary))
         
         tags.forEach { tag ->
-            eventTags.put(JSONArray().put("t").put(tag))
+            eventTags.add(listOf("t", tag))
         }
 
         fallbacks.forEach { fallbackUrl ->
-            eventTags.put(JSONArray().put("fallback").put(fallbackUrl))
+            eventTags.add(listOf("fallback", fallbackUrl))
         }
 
-        val event = JSONObject()
-        event.put("kind", 1063)
-        event.put("content", summary ?: "")
-        event.put("pubkey", pubkey)
-        event.put("created_at", System.currentTimeMillis() / 1000)
-        event.put("tags", eventTags)
+        val event = mutableMapOf<String, Any>(
+            "kind" to 1063,
+            "content" to (summary ?: ""),
+            "pubkey" to pubkey,
+            "created_at" to System.currentTimeMillis() / 1000,
+            "tags" to eventTags
+        )
 
-        return event.toString()
+        return mapAdapter.toJson(event)
     }
 
     /**

@@ -34,7 +34,7 @@ class BlossomRepository(private val context: Context) {
         return url.removeSuffix("/").lowercase()
     }
 
-    private val client = OkHttpClient.Builder()
+    val client = OkHttpClient.Builder()
         .addInterceptor(HttpLoggingInterceptor().apply { level = HttpLoggingInterceptor.Level.HEADERS })
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(60, TimeUnit.SECONDS)
@@ -262,6 +262,14 @@ class BlossomRepository(private val context: Context) {
         expectedHash: String
     ): Result<BlossomUploadResult> = withContext(Dispatchers.IO) {
         try {
+            // 1. Check if blob already exists via HEAD (optimization)
+            if (checkBlobExists(serverUrl, expectedHash)) {
+                Log.i("BlossomRepo", "Blob $expectedHash already exists on $serverUrl, skipping upload.")
+                val cleanServer = serverUrl.removeSuffix("/")
+                // Most Blossom servers serve at /<hash>
+                return@withContext Result.success(BlossomUploadResult("$cleanServer/$expectedHash", expectedHash, serverUrl))
+            }
+
             val processed = processFile(uri, mimeType)
             if (processed.hash != expectedHash) {
                 return@withContext Result.failure(Exception("Hash mismatch during re-processing. Original: $expectedHash, New: ${processed.hash}"))
@@ -368,45 +376,61 @@ class BlossomRepository(private val context: Context) {
     }
 
     private fun stripJpegMetadata(input: InputStream, output: OutputStream): Boolean {
+        // Verify SOI marker (0xFFD8)
         if (input.read() != 0xFF || input.read() != 0xD8) return false
         output.write(0xFF); output.write(0xD8)
+
         while (true) {
-            var marker = input.read()
+            // Find next marker
+            var b = input.read()
+            while (b != 0xFF) { if (b == -1) return false; b = input.read() }
             var type = input.read()
-            while (marker != 0xFF || type == 0xFF || type == 0x00) {
-                marker = type
-                type = input.read()
-                if (type == -1) return true
-            }
+            while (type == 0xFF) { type = input.read() }
+            if (type == -1) break
+
+            // SOS (Start of Scan) — copy the rest of the file verbatim
             if (type == 0xDA) {
                 output.write(0xFF); output.write(type)
                 input.copyTo(output)
                 return true
             }
+            // EOI (End of Image)
             if (type == 0xD9) {
                 output.write(0xFF); output.write(type)
                 return true
             }
+
+            // Read segment length
             val lenHigh = input.read()
             val lenLow = input.read()
             if (lenHigh == -1 || lenLow == -1) return false
             val length = (lenHigh shl 8) or lenLow
+
+            // STRIP ONLY: APP1 (0xE1) — Exif / XMP
+            // KEEP: APP0 (JFIF), APP2 (ICC), APP14 (Adobe), COM
             if (type == 0xE1) {
-                input.skip(length.toLong() - 2)
+                // Skip this segment
+                skipBytes(input, length - 2)
             } else {
-                output.write(0xFF); output.write(type)
-                output.write(lenHigh); output.write(lenLow)
+                // Copy this segment
+                output.write(0xFF)
+                output.write(type)
+                output.write(lenHigh)
+                output.write(lenLow)
                 copyBytes(input, output, length - 2)
             }
         }
+        return true
     }
 
     private fun stripPngMetadata(input: InputStream, output: OutputStream): Boolean {
+        // Verify PNG signature
         val sig = ByteArray(8)
         if (input.read(sig) != 8) return false
         val expected = byteArrayOf(0x89.toByte(), 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A)
         if (!sig.contentEquals(expected)) return false
         output.write(sig)
+
         val header = ByteArray(8)
         while (input.read(header, 0, 8) == 8) {
             val length = ((header[0].toInt() and 0xFF) shl 24) or
@@ -414,16 +438,28 @@ class BlossomRepository(private val context: Context) {
                          ((header[2].toInt() and 0xFF) shl 8) or
                          (header[3].toInt() and 0xFF)
             val type = String(header, 4, 4, StandardCharsets.US_ASCII)
+
+            // STRIP: eXIf, tEXt, zTXt, iTXt
             val shouldStrip = type in listOf("eXIf", "tEXt", "zTXt", "iTXt")
+
             if (shouldStrip) {
-                input.skip(length.toLong() + 4)
+                skipBytes(input, length + 4) // data + CRC
             } else {
                 output.write(header)
-                copyBytes(input, output, length + 4)
+                copyBytes(input, output, length + 4) // data + CRC
                 if (type == "IEND") return true
             }
         }
         return true
+    }
+    
+    private fun skipBytes(input: InputStream, count: Int) {
+        var remaining = count.toLong()
+        while (remaining > 0) {
+            val skipped = input.skip(remaining)
+            if (skipped <= 0) break
+            remaining -= skipped
+        }
     }
     
     private fun copyBytes(input: InputStream, output: OutputStream, count: Int) {

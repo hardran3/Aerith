@@ -8,7 +8,7 @@ import coil.disk.DiskCache
 import coil.memory.MemoryCache
 import kotlinx.coroutines.Dispatchers
 import androidx.media3.database.StandaloneDatabaseProvider
-import androidx.media3.datasource.cache.NoOpCacheEvictor
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
 import androidx.media3.datasource.cache.SimpleCache
 import java.io.File
 
@@ -23,11 +23,24 @@ class AerithApp : Application(), ImageLoaderFactory {
         super.onCreate()
         val cacheDir = File(cacheDir, "video_cache")
         val databaseProvider = StandaloneDatabaseProvider(this)
-        videoCache = SimpleCache(cacheDir, NoOpCacheEvictor(), databaseProvider)
+        val evictor = LeastRecentlyUsedCacheEvictor(2048L * 1024 * 1024) // 2GB
+        videoCache = SimpleCache(cacheDir, evictor, databaseProvider)
     }
 
     override fun newImageLoader(): ImageLoader {
+        val okHttpClient = okhttp3.OkHttpClient.Builder()
+            .addInterceptor { chain ->
+                val request = chain.request().newBuilder()
+                    .header("User-Agent", "Aerith/1.0")
+                    .build()
+                chain.proceed(request)
+            }
+            .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .readTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+            .build()
+
         return ImageLoader.Builder(this)
+            .okHttpClient(okHttpClient)
             .memoryCache {
                 MemoryCache.Builder(this)
                     .maxSizePercent(0.3) // Increase memory cache to 30%
@@ -36,7 +49,7 @@ class AerithApp : Application(), ImageLoaderFactory {
             .diskCache {
                 DiskCache.Builder()
                     .directory(this.cacheDir.resolve("image_cache"))
-                    .maxSizeBytes(512 * 1024 * 1024) // 512MB
+                    .maxSizeBytes(2048L * 1024 * 1024) // 2GB
                     .build()
             }
             .fetcherDispatcher(Dispatchers.IO)

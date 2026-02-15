@@ -93,9 +93,6 @@ class SettingsRepository(context: Context) {
         saveLocallyCachedHashes(current)
     }
 
-    fun isServerBadgeEnabled(): Boolean = prefs.getBoolean("display_server_badge", true)
-    fun setServerBadgeEnabled(enabled: Boolean) = prefs.edit().putBoolean("display_server_badge", enabled).apply()
-
     fun isFileTypeBadgeEnabled(): Boolean = prefs.getBoolean("display_filetype_badge", true)
     fun setFileTypeBadgeEnabled(enabled: Boolean) = prefs.edit().putBoolean("display_filetype_badge", enabled).apply()
 

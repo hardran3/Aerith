@@ -111,6 +111,23 @@ data class BlossomBlob(
     }
 
     /**
+     * Helper to get the file extension based on MIME type.
+     */
+    fun getExtension(): String {
+        val mime = getMimeType() ?: return ""
+        return when {
+            mime.contains("jpeg") || mime.contains("jpg") -> "jpg"
+            mime.contains("png") -> "png"
+            mime.contains("gif") -> "gif"
+            mime.contains("webp") -> "webp"
+            mime.contains("mp4") -> "mp4"
+            mime.contains("mov") -> "mov"
+            mime.contains("webm") -> "webm"
+            else -> mime.substringAfterLast("/", "")
+        }
+    }
+
+    /**
      * Helper to get the creation timestamp regardless of which field the server used.
      */
     fun getCreationTime(): Long? {

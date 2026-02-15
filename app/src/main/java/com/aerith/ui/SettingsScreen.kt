@@ -90,24 +90,8 @@ private fun GeneralTab(
 
         Card(modifier = Modifier.fillMaxWidth()) {
             Column {
-                var serverBadgeEnabled by remember { mutableStateOf(settingsRepository.isServerBadgeEnabled()) }
                 var fileTypeBadgeEnabled by remember { mutableStateOf(settingsRepository.isFileTypeBadgeEnabled()) }
 
-                ListItem(
-                    headlineContent = { Text("Server Count Badge") },
-                    supportingContent = { Text("Show how many servers host this file") },
-                    trailingContent = {
-                        Switch(
-                            checked = serverBadgeEnabled,
-                            onCheckedChange = {
-                                serverBadgeEnabled = it
-                                settingsRepository.setServerBadgeEnabled(it)
-                                galleryViewModel.refreshDisplaySettings()
-                            }
-                        )
-                    }
-                )
-                
                 ListItem(
                     headlineContent = { Text("File Type Badge") },
                     supportingContent = { Text("Show extension (JPG, MP4, etc)") },
@@ -240,6 +224,10 @@ private fun NostrTab(authState: AuthState) {
 
 @Composable
 private fun BlossomTab(authState: AuthState) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val vaultManager = remember { com.aerith.core.data.BlobVaultManager(context) }
+    val vaultStats = remember { vaultManager.getVaultStats() }
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
@@ -251,6 +239,32 @@ private fun BlossomTab(authState: AuthState) {
                 style = MaterialTheme.typography.titleMedium,
                 color = MaterialTheme.colorScheme.primary
             )
+        }
+
+        item {
+            Card(modifier = Modifier.fillMaxWidth()) {
+                val sizeText = when {
+                    vaultStats.second > 1024L * 1024 * 1024 -> String.format("%.2f GB", vaultStats.second / (1024.0 * 1024 * 1024))
+                    else -> String.format("%.2f MB", vaultStats.second / (1024.0 * 1024))
+                }
+                
+                ListItem(
+                    headlineContent = { Text("Local App Vault") },
+                    supportingContent = { 
+                        Text("${vaultStats.first} files cached in Pictures/Aerith/Vault") 
+                    },
+                    leadingContent = {
+                        Icon(Icons.Default.Save, contentDescription = null, tint = MaterialTheme.colorScheme.primary)
+                    },
+                    trailingContent = {
+                        Text(
+                            text = sizeText,
+                            style = MaterialTheme.typography.labelLarge,
+                            color = MaterialTheme.colorScheme.secondary
+                        )
+                    }
+                )
+            }
         }
 
         item {

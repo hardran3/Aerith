@@ -53,6 +53,7 @@ fun MediaViewerScreen(
     url: String,
     authState: AuthState,
     authViewModel: com.aerith.auth.AuthViewModel,
+    onBack: () -> Unit,
     galleryViewModel: GalleryViewModel = viewModel()
 ) {
     val uiState by galleryViewModel.uiState.collectAsState()
@@ -63,22 +64,29 @@ fun MediaViewerScreen(
     val currentBlob = remember(uiState.allBlobs, uiState.trashBlobs, url) { 
         uiState.allBlobs.find { it.url == url } ?: uiState.trashBlobs.find { it.url == url }
     }
-    val isPinned = remember(currentBlob, uiState.pinnedHashes) {
-        currentBlob != null && uiState.pinnedHashes.contains(currentBlob.sha256)
+    
+    var showInfoSheet by remember { mutableStateOf(false) }
+    var showServerSheet by remember { mutableStateOf(false) }
+    val isVaulted = remember(currentBlob, uiState.vaultedHashes) {
+        currentBlob != null && uiState.vaultedHashes.contains(currentBlob.sha256)
     }
     val isVideo = remember(currentBlob) { currentBlob?.getMimeType()?.startsWith("video/") == true }
     val isLocallyCached = remember(currentBlob, uiState.locallyCachedHashes) {
         currentBlob != null && uiState.locallyCachedHashes.contains(currentBlob.sha256)
     }
+    val vaultManager = remember { com.aerith.core.data.BlobVaultManager(context) }
 
     val exoPlayer = remember {
         val httpDataSourceFactory = DefaultHttpDataSource.Factory()
             .setUserAgent("Aerith/1.0")
             .setAllowCrossProtocolRedirects(true)
 
+        // Use DefaultDataSource to support both local file:// and remote http:// URIs
+        val dataSourceFactory = androidx.media3.datasource.DefaultDataSource.Factory(context, httpDataSourceFactory)
+
         val cacheDataSourceFactory = CacheDataSource.Factory()
             .setCache(AerithApp.videoCache)
-            .setUpstreamDataSourceFactory(httpDataSourceFactory)
+            .setUpstreamDataSourceFactory(dataSourceFactory)
             .setFlags(CacheDataSource.FLAG_IGNORE_CACHE_ON_ERROR)
 
         ExoPlayer.Builder(context)
@@ -89,10 +97,10 @@ fun MediaViewerScreen(
             }
     }
 
-    LaunchedEffect(url, isPinned, isLocallyCached) {
+    LaunchedEffect(url, isVaulted, isLocallyCached) {
         if (isVideo) {
             val mediaUri = when {
-                isPinned && currentBlob != null -> Uri.fromFile(java.io.File(context.filesDir, "persistent_media/${currentBlob.sha256}"))
+                isVaulted && currentBlob != null -> Uri.fromFile(vaultManager.getVaultFile(currentBlob.sha256))
                 isLocallyCached && currentBlob != null && authState.localBlossomUrl != null -> Uri.parse("${authState.localBlossomUrl}/${currentBlob.sha256}")
                 else -> Uri.parse(url)
             }
@@ -116,12 +124,28 @@ fun MediaViewerScreen(
         }
     }
 
-    var showInfoSheet by remember { mutableStateOf(false) }
-    var showServerSheet by remember { mutableStateOf(false) }
+    // Background re-verification: Check servers that didn't list the file as soon as we open fullscreen
+    LaunchedEffect(currentBlob) {
+        if (currentBlob != null) {
+            authState.blossomServers.forEach { server ->
+                val isOnServer = relatedBlobs.any { it.serverUrl == server }
+                if (!isOnServer) {
+                    galleryViewModel.verifyBlobExistence(server, currentBlob)
+                }
+            }
+        }
+    }
+
     var showJsonDialog by remember { mutableStateOf(false) }
+    var tagToRemove by remember { mutableStateOf<String?>(null) }
+    var isHudVisible by remember { mutableStateOf(true) }
     val infoSheetState = rememberModalBottomSheetState()
     val serverSheetState = rememberModalBottomSheetState()
     
+    val currentTags = remember(currentBlob?.nip94, uiState.fileMetadata) { 
+        currentBlob?.getTags(uiState.fileMetadata) ?: emptyList()
+    }
+
     var blobToDelete by remember { mutableStateOf<com.aerith.core.blossom.BlossomBlob?>(null) }
     var pendingMirrorServer by remember { mutableStateOf<String?>(null) }
     var pendingLabelUpdateTags by remember { mutableStateOf<List<String>?>(null) }
@@ -151,8 +175,8 @@ fun MediaViewerScreen(
                     pendingLabelUpdateTags = null
                 } else if (pendingNameUpdate != null && currentBlob != null) {
                     val pk = authState.pubkey ?: return@rememberLauncherForActivityResult
-                    val currentTags = currentBlob.getTags(uiState.fileMetadata)
-                    galleryViewModel.updateLabels(pk, authState.relays, currentBlob, currentTags, signedJson, signer, authState.signerPackage, newName = pendingNameUpdate)
+                    val currentTagsForName = currentBlob.getTags(uiState.fileMetadata)
+                    galleryViewModel.updateLabels(pk, authState.relays, currentBlob, currentTagsForName, signedJson, signer, authState.signerPackage, newName = pendingNameUpdate)
                     
                     val existingNip94 = (currentBlob.nip94 as? List<*>)?.filterIsInstance<List<String>>() ?: emptyList()
                     val otherTags = existingNip94.filter { it.firstOrNull() != "name" }
@@ -165,22 +189,30 @@ fun MediaViewerScreen(
         }
     }
 
+    // Background re-verification: Check servers that didn't list the file as soon as we open fullscreen
+    LaunchedEffect(currentBlob) {
+        if (currentBlob != null) {
+            authState.blossomServers.forEach { server ->
+                val isOnServer = relatedBlobs.any { it.serverUrl == server }
+                if (!isOnServer) {
+                    galleryViewModel.verifyBlobExistence(server, currentBlob)
+                }
+            }
+        }
+    }
+
     fun shareMedia(context: Context, url: String, mimeType: String, hash: String) {
         scope.launch(Dispatchers.IO) {
             try {
-                // 1. Try to get from Coil Disk Cache (for images)
-                var file: File? = null
-                if (!mimeType.startsWith("video/")) {
-                    val imageLoader = coil.Coil.imageLoader(context)
-                    val snapshot = imageLoader.diskCache?.get(hash)
-                    file = snapshot?.data?.toFile()
-                }
+                // 1. Try to get from Vault first
+                var file = vaultManager.getVaultFile(hash)
 
-                // 2. If not in cache, check persistent storage or local blossom
+                // 2. Try to get from Coil Disk Cache (for images)
                 if (file == null || !file.exists()) {
-                    val persistentFile = File(context.filesDir, "persistent_media/$hash")
-                    if (persistentFile.exists()) {
-                        file = persistentFile
+                    if (!mimeType.startsWith("video/")) {
+                        val imageLoader = coil.Coil.imageLoader(context)
+                        val snapshot = imageLoader.diskCache?.get(hash)
+                        file = snapshot?.data?.toFile()
                     }
                 }
 
@@ -242,20 +274,30 @@ fun MediaViewerScreen(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .clickable(
+                interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() },
+                indication = null,
+                onClick = { isHudVisible = !isHudVisible }
+            )
     ) {
         if (isVideo) {
             AndroidView(
                 factory = { ctx ->
                     PlayerView(ctx).apply {
                         player = exoPlayer
-                        useController = true
+                        useController = isHudVisible
+                        setControllerAutoShow(false) // We manage it
                     }
+                },
+                update = { view ->
+                    view.useController = isHudVisible
+                    if (isHudVisible) view.showController() else view.hideController()
                 },
                 modifier = Modifier.fillMaxSize()
             )
         } else {
             val model = when {
-                isPinned && currentBlob != null -> java.io.File(context.filesDir, "persistent_media/${currentBlob.sha256}")
+                isVaulted && currentBlob != null -> vaultManager.getVaultFile(currentBlob.sha256)
                 isLocallyCached && currentBlob != null && authState.localBlossomUrl != null -> "${authState.localBlossomUrl}/${currentBlob.sha256}"
                 else -> url
             }
@@ -263,8 +305,7 @@ fun MediaViewerScreen(
             SubcomposeAsyncImage(
                 model = ImageRequest.Builder(LocalContext.current)
                     .data(model)
-                    .diskCacheKey(currentBlob?.sha256)
-                    .memoryCacheKey(currentBlob?.sha256)
+                    .crossfade(true)
                     .build(),
                 contentDescription = null,
                 contentScale = ContentScale.Fit,
@@ -277,11 +318,87 @@ fun MediaViewerScreen(
             )
         }
 
+        // --- Top Left: Tags ---
+        androidx.compose.animation.AnimatedVisibility(
+            visible = isHudVisible && currentTags.isNotEmpty(),
+            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically(),
+            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(),
+            modifier = Modifier.align(Alignment.TopStart)
+        ) {
+            FlowRow(
+                modifier = Modifier
+                    .padding(16.dp)
+                    .padding(WindowInsets.statusBars.asPaddingValues())
+                    .fillMaxWidth(0.7f),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                currentTags.forEach { tag ->
+                    SuggestionChip(
+                        onClick = { tagToRemove = tag },
+                        label = { Text(tag, color = Color.White) },
+                        colors = SuggestionChipDefaults.suggestionChipColors(
+                            containerColor = Color.Black.copy(alpha = 0.4f)
+                        ),
+                        border = SuggestionChipDefaults.suggestionChipBorder(
+                            enabled = true,
+                            borderColor = Color.White.copy(alpha = 0.3f)
+                        )
+                    )
+                }
+            }
+        }
+
+        // --- Tag Removal Confirmation ---
+        if (tagToRemove != null) {
+            AlertDialog(
+                onDismissRequest = { tagToRemove = null },
+                title = { Text("Remove Label") },
+                text = { Text("Are you sure you want to remove the label \"${tagToRemove}\"?") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        val tag = tagToRemove!!
+                        val pk = authState.pubkey
+                        val pkg = authState.signerPackage
+                        if (pk != null && currentBlob != null) {
+                            val updatedTags = currentTags.filter { it != tag }
+                            val unsigned = BlossomAuthHelper.createFileMetadataEvent(
+                                pk, currentBlob.sha256, url, currentBlob.getMimeType(), updatedTags
+                            )
+                            val signed = if (pkg != null) signer.signEventBackground(pkg, unsigned, pk) else null
+                            if (signed != null) {
+                                galleryViewModel.updateLabels(pk, authState.relays, currentBlob, updatedTags, signed, signer, pkg)
+                                
+                                val existingNip94 = (currentBlob.nip94 as? List<*>)?.filterIsInstance<List<String>>() ?: emptyList()
+                                val otherTags = existingNip94.filter { it.firstOrNull() != "t" }
+                                val newNip94 = otherTags + updatedTags.map { listOf("t", it) }
+                                authViewModel.updateMetadata(currentBlob.sha256, newNip94)
+                            } else {
+                                pendingLabelUpdateTags = updatedTags
+                                signLauncher.launch(signer.getSignEventIntent(unsigned, pk))
+                            }
+                        }
+                        tagToRemove = null
+                    }) {
+                        Text("Remove", color = MaterialTheme.colorScheme.error)
+                    }
+                },
+                dismissButton = {
+                    TextButton(onClick = { tagToRemove = null }) {
+                        Text("Cancel")
+                    }
+                }
+            )
+        }
+
         // --- Fast Local indicator ---
-        if (isLocallyCached && !isVideo) {
+        androidx.compose.animation.AnimatedVisibility(
+            visible = isHudVisible && isVaulted && !isVideo,
+            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically(),
+            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(),
+            modifier = Modifier.align(Alignment.TopEnd)
+        ) {
             Box(
                 modifier = Modifier
-                    .align(Alignment.TopEnd)
                     .padding(16.dp)
                     .padding(WindowInsets.statusBars.asPaddingValues())
                     .background(Color.Black.copy(alpha = 0.4f), CircleShape)
@@ -290,14 +407,14 @@ fun MediaViewerScreen(
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
                     Icon(
-                        Icons.Default.FlashOn, 
+                        Icons.Default.Verified, 
                         null, 
                         tint = Color(0xFFC8E6C9), 
                         modifier = Modifier.size(14.dp)
                     )
                     Spacer(Modifier.width(4.dp))
                     Text(
-                        "LOCAL", 
+                        "VAULT", 
                         style = MaterialTheme.typography.labelSmall, 
                         color = Color.White,
                         fontWeight = androidx.compose.ui.text.font.FontWeight.Bold
@@ -307,39 +424,83 @@ fun MediaViewerScreen(
         }
         
         // Bottom Bar with Actions
-        Row(
-            modifier = Modifier
-                .align(Alignment.BottomCenter)
-                .fillMaxWidth()
-                .background(Color.Black.copy(alpha = 0.5f))
-                .padding(16.dp)
-                .padding(WindowInsets.navigationBars.asPaddingValues()),
-            horizontalArrangement = Arrangement.SpaceEvenly,
-            verticalAlignment = Alignment.CenterVertically
+        androidx.compose.animation.AnimatedVisibility(
+            visible = isHudVisible,
+            enter = androidx.compose.animation.fadeIn() + androidx.compose.animation.slideInVertically(initialOffsetY = { it }),
+            exit = androidx.compose.animation.fadeOut() + androidx.compose.animation.slideOutVertically(targetOffsetY = { it }),
+            modifier = Modifier.align(Alignment.BottomCenter)
         ) {
-            // Share Button
-            IconButton(
-                onClick = {
-                    if (currentBlob != null) {
-                        shareMedia(context, url, currentBlob.getMimeType() ?: "image/*", currentBlob.sha256)
+            Column {
+                // Spacer to avoid overlapping with video controls (seek bar)
+                if (isVideo) {
+                    Spacer(modifier = Modifier.height(48.dp))
+                }
+                
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.Black.copy(alpha = 0.5f))
+                        .padding(16.dp)
+                        .padding(WindowInsets.navigationBars.asPaddingValues()),
+                    horizontalArrangement = Arrangement.SpaceEvenly,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    // Web Share (Copy Link) - Far Left
+                    IconButton(
+                        onClick = {
+                            val firstUrl = relatedBlobs.find { it.serverUrl != null }?.url ?: url
+                            val clipboard = context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+                            val clip = android.content.ClipData.newPlainText("Media Link", firstUrl)
+                            clipboard.setPrimaryClip(clip)
+                            android.widget.Toast.makeText(context, "Link copied to clipboard", android.widget.Toast.LENGTH_SHORT).show()
+                        }
+                    ) {
+                        Icon(Icons.Default.Language, "Copy Link", tint = Color.White)
+                    }
+
+                    // Share Button
+                    IconButton(
+                        onClick = {
+                            if (currentBlob != null) {
+                                shareMedia(context, url, currentBlob.getMimeType() ?: "image/*", currentBlob.sha256)
+                            }
+                        }
+                    ) {
+                        Icon(Icons.Default.Share, "Share", tint = Color.White)
+                    }
+
+                    // Server Settings Button
+                    IconButton(
+                        onClick = { showServerSheet = true }
+                    ) {
+                        val serverCount = remember(relatedBlobs, isLocallyCached) {
+                            val remoteCount = relatedBlobs.mapNotNull { it.serverUrl }.distinct().size
+                            if (isLocallyCached) remoteCount + 1 else remoteCount
+                        }
+                        
+                        BadgedBox(
+                            badge = {
+                                if (serverCount > 0) {
+                                    Badge(
+                                        containerColor = MaterialTheme.colorScheme.primary,
+                                        contentColor = MaterialTheme.colorScheme.onPrimary
+                                    ) {
+                                        Text(serverCount.toString())
+                                    }
+                                }
+                            }
+                        ) {
+                            Icon(Icons.Default.Storage, "Servers", tint = Color.White)
+                        }
+                    }
+
+                    // Info Button
+                    IconButton(
+                        onClick = { showInfoSheet = true }
+                    ) {
+                        Icon(Icons.Default.Info, "Details", tint = Color.White)
                     }
                 }
-            ) {
-                Icon(Icons.Default.Share, "Share", tint = Color.White)
-            }
-
-            // Server Settings Button
-            IconButton(
-                onClick = { showServerSheet = true }
-            ) {
-                Icon(Icons.Default.Storage, "Servers", tint = Color.White)
-            }
-
-            // Info Button
-            IconButton(
-                onClick = { showInfoSheet = true }
-            ) {
-                Icon(Icons.Default.Info, "Details", tint = Color.White)
             }
         }
         
@@ -577,7 +738,18 @@ fun MediaViewerScreen(
                     currentTags,
                     name = currentBlob.getName(uiState.fileMetadata)
                 )
-                org.json.JSONObject(unsigned).toString(4)
+                
+                // Pretty print using Moshi instead of JSONObject to avoid escaping slashes
+                try {
+                    val moshi = com.squareup.moshi.Moshi.Builder()
+                        .add(com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory())
+                        .build()
+                    val adapter = moshi.adapter(Any::class.java).indent("    ")
+                    val obj = adapter.fromJson(unsigned)
+                    adapter.toJson(obj)
+                } catch (e: Exception) {
+                    unsigned // Fallback to raw if pretty-print fails
+                }
             }
 
             AlertDialog(
@@ -621,16 +793,6 @@ fun MediaViewerScreen(
 
         // --- Server Management Sheet ---
         if (showServerSheet && currentBlob != null) {
-            // Background re-verification: Check servers that didn't list the file
-            LaunchedEffect(showServerSheet) {
-                authState.blossomServers.forEach { server ->
-                    val isOnServer = relatedBlobs.any { it.serverUrl == server }
-                    if (!isOnServer) {
-                        galleryViewModel.verifyBlobExistence(server, currentBlob)
-                    }
-                }
-            }
-
             ModalBottomSheet(
                 onDismissRequest = { showServerSheet = false },
                 sheetState = serverSheetState
